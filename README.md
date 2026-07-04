@@ -1,0 +1,73 @@
+# syncthing-swarm
+
+Central dashboard for many syncthing nodes. Folders = rows, machines = columns.
+One table. See sync %, state, errors, version across whole fleet. No more ssh
++ port-forward + tab soup.
+
+Nothing existing do this (see vault research). Build on syncthing official REST
+API. Nodes reachable over Tailscale.
+
+## Tech stack (caveman)
+
+- **Backend** Go. One binary `swarmd`. Read `swarm.yaml` cred store. Poll every
+  node REST API concurrent. Merge into one matrix. Serve JSON + web.
+- **Frontend** Vite + SolidJS + Tailwind v4. Build to static. Go embed into
+  binary (`-tags embedweb`). Single file deploy.
+- **Transport** Tailscale. Hub hit each node `http://<tailnet-ip>:8384` with
+  its `X-API-Key`. No port-forward.
+- **Cred store** `swarm.yaml`. Plaintext. Gitignored. You edit, add node.
+- **State** in-memory snapshot. Poll loop every N sec. No DB (MVP).
+
+## Layout
+
+```
+cmd/swarmd/          main. flag -config, signal shutdown
+internal/config/     load+validate swarm.yaml
+internal/stclient/   one node REST client (version, config, db/status, errors)
+internal/aggregate/  fan-out all nodes -> Snapshot{devices,folders,cells}
+internal/server/     poll loop + /api/matrix + serve embedded web
+internal/webui/      go embed of built frontend (dist)
+web/                 vite+solid+tailwind source
+```
+
+## REST endpoints hit per node
+
+- `/rest/system/version` — version column
+- `/rest/system/status` — device id
+- `/rest/system/error` — device-level errors
+- `/rest/config` — folders + share topology
+- `/rest/db/status?folder=` — per-folder state, need/global bytes -> completion
+- `/rest/folder/errors?folder=` — per-folder pull errors
+
+## Run
+
+```bash
+cp swarm.example.yaml swarm.yaml     # fill in nodes + apikeys
+go run ./cmd/swarmd                   # API on :8888, no UI
+# dev UI (hot reload, proxies /api):
+npm --prefix web install
+npm --prefix web run dev              # vite :5173
+
+# single binary (embed UI):
+npm --prefix web run build
+go build -tags embedweb -o swarmd ./cmd/swarmd
+./swarmd                              # full dashboard on listen addr
+```
+
+`make build` do the two-step. `make test` run go tests.
+
+## Get a node apikey
+
+Syncthing GUI -> Actions -> Settings -> API Key. Or `grep <apikey>` in that
+node config.xml.
+
+## Roadmap (phases)
+
+1. **MVP** read-only matrix. ← here
+2. **Actions** one-click share folder->device (PATCH `/rest/config/folders`,
+   `autoAcceptFolders`), pause/rescan, approve pending devices.
+3. **st-cli** connect/test node, pull logs, add node to swarm.yaml.
+4. **Wizard** Tailscale+SSH -> apt install syncthing -> generate config ->
+   auto-register into swarm + sharing graph.
+
+Full spec in vault: `50-59 pet projects and hobbies/55 syncthing-swarm/`.

@@ -1,0 +1,22 @@
+# syncthing-swarm cred store — copy to swarm.yaml and fill in.
+# swarm.yaml is gitignored (plaintext keys). Tailnet-only, MVP.
+#
+# get apikey per node: Syncthing GUI -> Actions -> Settings -> API Key
+#   or grep <apikey> in that node's config.xml
+# url = tailscale IP (or hostname) + GUI port (default 8384)
+
+listen: "127.0.0.1:8888"   # where this dashboard serves
+pollSeconds: 15            # how often to poll every node
+
+nodes:
+  - name: pi-attic
+    url: http://100.101.102.103:8384
+    apikey: REPLACE_ME_ATTIC
+
+  - name: vps-hetzner
+    url: http://100.104.105.106:8384
+    apikey: REPLACE_ME_HETZNER
+
+  - name: phone-pixel
+    url: http://100.107.108.109:8384
+    apikey: REPLACE_ME_PIXEL
