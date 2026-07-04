@@ -6,12 +6,12 @@ run:
 
 # frontend dev server (hot reload, proxies /api -> :8888)
 dev:
-	npm --prefix web run dev
+	pnpm --dir web run dev
 
 # build frontend into internal/webui/dist
 web:
-	npm --prefix web install
-	npm --prefix web run build
+	pnpm --dir web install
+	pnpm --dir web run build
 
 # single self-contained binary with UI embedded
 build: web

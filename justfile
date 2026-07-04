@@ -15,12 +15,12 @@ run:
 
 # frontend dev server: hot reload, proxies /api -> :8888 (run `just run` too)
 dev:
-    npm --prefix web run dev
+    pnpm --dir web run dev
 
 # build frontend into internal/webui/dist
 web:
-    npm --prefix web install
-    npm --prefix web run build
+    pnpm --dir web install
+    pnpm --dir web run build
 
 # compile self-contained binary ./swarmd (UI embedded)
 build: web

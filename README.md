@@ -45,11 +45,11 @@ web/                 vite+solid+tailwind source
 cp swarm.example.yaml swarm.yaml     # fill in nodes + apikeys
 go run ./cmd/swarmd                   # API on :8888, no UI
 # dev UI (hot reload, proxies /api):
-npm --prefix web install
-npm --prefix web run dev              # vite :5173
+pnpm --dir web install
+pnpm --dir web run dev                # vite :5173
 
 # single binary (embed UI):
-npm --prefix web run build
+pnpm --dir web run build
 go build -tags embedweb -o swarmd ./cmd/swarmd
 ./swarmd                              # full dashboard on listen addr
 ```
