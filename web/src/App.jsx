@@ -1,6 +1,6 @@
-import { createSignal, createResource, For, Show, onCleanup } from "solid-js";
+import { createSignal, createResource, createEffect, For, Show, onCleanup, createMemo } from "solid-js";
 
-const POLL_MS = 5000;
+const MATRIX_POLL = 5000;
 
 async function fetchMatrix() {
   const r = await fetch("/api/matrix");
@@ -8,70 +8,70 @@ async function fetchMatrix() {
   return r.json();
 }
 
-// color + label for a single (folder, device) cell
-function cellStyle(cell, online) {
-  if (!online) return { bg: "bg-slate-800/40 text-slate-600", label: "—", ring: "" };
-  if (!cell || !cell.present) return { bg: "bg-slate-900 text-slate-700", label: "·", ring: "" };
-  const errs = cell.errors && cell.errors.length;
-  if (errs || cell.state === "error")
-    return { bg: "bg-red-900/70 text-red-200", label: "err", ring: "ring-1 ring-red-500" };
-  if (cell.state === "paused")
-    return { bg: "bg-slate-700/50 text-slate-400", label: "pause", ring: "" };
-  if (cell.state === "syncing")
-    return { bg: "bg-sky-800/70 text-sky-100", label: pct(cell.completion), ring: "" };
-  if (cell.state === "scanning")
-    return { bg: "bg-amber-800/60 text-amber-100", label: "scan", ring: "" };
-  if (cell.completion >= 99.95)
-    return { bg: "bg-emerald-800/60 text-emerald-100", label: "100", ring: "" };
-  return { bg: "bg-amber-800/50 text-amber-100", label: pct(cell.completion), ring: "" };
+// call one node's syncthing REST via the hub relay (key injected server-side)
+async function relay(node, restPath, params) {
+  let url = `/api/node/${encodeURIComponent(node)}/${restPath}`;
+  if (params) url += "?" + new URLSearchParams(params).toString();
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(restPath + " -> " + r.status);
+  return r.json();
 }
 
 const pct = (n) => (n == null ? "?" : Math.floor(n) + "%");
-const bytes = (n) => {
+function bytes(n) {
   if (!n) return "0 B";
   const u = ["B", "KB", "MB", "GB", "TB"];
   let i = 0;
   while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-  return n.toFixed(1) + " " + u[i];
-};
+  return n.toFixed(n < 10 && i > 0 ? 1 : 0) + " " + u[i];
+}
+const speed = (bps) => (bps > 0 ? bytes(bps) + "/s" : "—");
+const completion = (g, need) => (g <= 0 || need <= 0 ? 100 : Math.max(0, (g - need) / g * 100));
+
+function cellStyle(cell, online) {
+  if (!online) return { bg: "bg-slate-800/40 text-slate-600", label: "—" };
+  if (!cell || !cell.present) return { bg: "bg-slate-900 text-slate-700", label: "·" };
+  if (cell.errors && cell.errors.length || cell.state === "error")
+    return { bg: "bg-red-900/70 text-red-200 ring-1 ring-red-500", label: "err" };
+  if (cell.state === "paused") return { bg: "bg-slate-700/50 text-slate-400", label: "pause" };
+  if (cell.state === "syncing") return { bg: "bg-sky-800/70 text-sky-100", label: pct(cell.completion) };
+  if (cell.state === "scanning") return { bg: "bg-amber-800/60 text-amber-100", label: "scan" };
+  if (cell.completion >= 99.95) return { bg: "bg-emerald-800/60 text-emerald-100", label: "100" };
+  return { bg: "bg-amber-800/50 text-amber-100", label: pct(cell.completion) };
+}
 
 export default function App() {
   const [data, { refetch }] = createResource(fetchMatrix);
-  const [sel, setSel] = createSignal(null); // {folder, device, cell}
-
-  const timer = setInterval(refetch, POLL_MS);
-  onCleanup(() => clearInterval(timer));
+  const [sel, setSel] = createSignal(null); // {folder, device?, tab?}
+  const t = setInterval(refetch, MATRIX_POLL);
+  onCleanup(() => clearInterval(t));
 
   return (
-    <div class="min-h-screen p-6">
-      <header class="mb-5 flex items-baseline gap-3">
-        <h1 class="text-xl font-semibold text-slate-100">syncthing swarm</h1>
-        <Show when={data()}>
-          <span class="text-xs text-slate-500">
-            {data().devices.length} devices · {data().folders.length} folders ·
-            polled {new Date(data().generatedAt).toLocaleTimeString()}
-          </span>
+    <div class="min-h-screen">
+      <div class="p-6" classList={{ "pb-[58vh]": !!sel() }}>
+        <header class="mb-5 flex items-baseline gap-3">
+          <h1 class="text-xl font-semibold text-slate-100">syncthing swarm</h1>
+          <Show when={data()}>
+            <span class="text-xs text-slate-500">
+              {data().devices.length} devices · {data().folders.length} folders ·
+              polled {new Date(data().generatedAt).toLocaleTimeString()}
+            </span>
+          </Show>
+          <button onClick={() => refetch()} class="ml-auto rounded bg-slate-700 px-3 py-1 text-xs hover:bg-slate-600">refresh</button>
+        </header>
+
+        <Show when={data.error}>
+          <div class="rounded bg-red-900/60 p-3 text-red-200">cannot reach swarmd: {String(data.error)}</div>
         </Show>
-        <button
-          onClick={() => refetch()}
-          class="ml-auto rounded bg-slate-700 px-3 py-1 text-xs hover:bg-slate-600"
-        >
-          refresh
-        </button>
-      </header>
-
-      <Show when={data.error}>
-        <div class="rounded bg-red-900/60 p-3 text-red-200">
-          cannot reach swarmd: {String(data.error)}
-        </div>
-      </Show>
-
-      <Show when={data()} fallback={<div class="text-slate-500">loading…</div>}>
-        <Matrix data={data()} onPick={setSel} />
-      </Show>
+        <Show when={data()} fallback={<div class="text-slate-500">loading…</div>}>
+          <Matrix data={data()} sel={sel()}
+            onFolder={(f) => setSel({ folder: f, tab: "files" })}
+            onCell={(f, d) => setSel({ folder: f, device: d.name, tab: "transfers" })} />
+        </Show>
+      </div>
 
       <Show when={sel()}>
-        <Drawer sel={sel()} onClose={() => setSel(null)} />
+        <Dock sel={sel()} data={data()} onClose={() => setSel(null)} />
       </Show>
     </div>
   );
@@ -79,38 +79,25 @@ export default function App() {
 
 function Matrix(props) {
   const d = () => props.data;
+  const selId = () => props.sel?.folder?.id;
   return (
     <div class="overflow-x-auto rounded-lg border border-slate-800">
       <table class="border-collapse text-sm">
         <thead>
           <tr>
-            <th class="sticky left-0 z-10 bg-[#0b0e14] p-2 text-left font-medium text-slate-400">
-              folder \ device
-            </th>
+            <th class="sticky left-0 z-10 bg-[#0b0e14] p-2 text-left font-medium text-slate-400">folder \ device</th>
             <For each={d().devices}>
               {(dev) => (
                 <th class="min-w-[120px] border-l border-slate-800 p-2 align-bottom">
                   <div class="flex items-center gap-1.5">
-                    <span
-                      class={
-                        "inline-block h-2 w-2 rounded-full " +
-                        (dev.online ? "bg-emerald-400" : "bg-slate-600")
-                      }
-                      title={dev.online ? "online" : "offline / unreachable"}
-                    />
+                    <span class={"inline-block h-2 w-2 rounded-full " + (dev.online ? "bg-emerald-400" : "bg-slate-600")}
+                      title={dev.online ? "online" : "offline"} />
                     <span class="font-semibold text-slate-200">{dev.name}</span>
                     <Show when={dev.systemErrors && dev.systemErrors.length}>
-                      <span
-                        class="rounded bg-red-600 px-1 text-[10px] text-white"
-                        title={dev.systemErrors.join("\n")}
-                      >
-                        {dev.systemErrors.length}!
-                      </span>
+                      <span class="rounded bg-red-600 px-1 text-[10px] text-white" title={dev.systemErrors.join("\n")}>{dev.systemErrors.length}!</span>
                     </Show>
                   </div>
-                  <div class="mt-0.5 text-[10px] font-normal text-slate-500">
-                    {dev.version || "—"}
-                  </div>
+                  <div class="mt-0.5 text-[10px] font-normal text-slate-500">{dev.version || "—"}</div>
                 </th>
               )}
             </For>
@@ -119,10 +106,14 @@ function Matrix(props) {
         <tbody>
           <For each={d().folders}>
             {(f) => (
-              <tr class="border-t border-slate-800">
-                <td class="sticky left-0 z-10 bg-[#0b0e14] p-2 font-medium text-slate-300">
-                  {f.label}
-                  <div class="text-[10px] font-normal text-slate-600">{f.id}</div>
+              <tr class="border-t border-slate-800" classList={{ "bg-slate-800/30": selId() === f.id }}>
+                <td class="sticky left-0 z-10 bg-[#0b0e14] p-2">
+                  <button class="text-left font-medium text-slate-200 hover:text-sky-300"
+                    classList={{ "text-sky-300": selId() === f.id }}
+                    onClick={() => props.onFolder(f)}>
+                    {f.label}
+                    <div class="text-[10px] font-normal text-slate-600">{f.id}</div>
+                  </button>
                 </td>
                 <For each={d().devices}>
                   {(dev) => {
@@ -130,19 +121,10 @@ function Matrix(props) {
                     const s = () => cellStyle(cell(), dev.online);
                     return (
                       <td class="border-l border-slate-800 p-1 text-center">
-                        <button
-                          class={
-                            "w-full rounded px-2 py-1.5 text-xs font-medium " +
-                            s().bg + " " + s().ring +
-                            (cell() && cell().present ? " cursor-pointer hover:brightness-125" : " cursor-default")
-                          }
+                        <button class={"w-full rounded px-2 py-1.5 text-xs font-medium " + s().bg +
+                          (cell() && cell().present ? " cursor-pointer hover:brightness-125" : " cursor-default")}
                           disabled={!cell() || !cell().present || !dev.online}
-                          onClick={() =>
-                            props.onPick({ folder: f, device: dev, cell: cell() })
-                          }
-                        >
-                          {s().label}
-                        </button>
+                          onClick={() => props.onCell(f, dev)}>{s().label}</button>
                       </td>
                     );
                   }}
@@ -156,68 +138,214 @@ function Matrix(props) {
   );
 }
 
-function Drawer(props) {
-  const s = props.sel;
-  const c = s.cell || {};
+// ---------- bottom dock ----------
+
+function Dock(props) {
+  const folder = () => props.sel.folder;
+  const [tab, setTab] = createSignal(props.sel.tab || "files");
+  // devices online that have this folder present (source for browse/logs)
+  const presentDevices = createMemo(() =>
+    props.data.devices.filter((dev) => dev.online && (props.data.cells[folder().id] || {})[dev.name]?.present));
+  const initialDev = () => {
+    const want = props.sel.device;
+    if (want && presentDevices().some((d) => d.name === want)) return want;
+    return presentDevices()[0]?.name || props.data.devices.find((d) => d.online)?.name || "";
+  };
+  const [dev, setDev] = createSignal(initialDev());
+  // reset source device when folder changes (or current source lost the folder)
+  createEffect(() => {
+    folder();
+    if (!presentDevices().some((d) => d.name === dev())) setDev(presentDevices()[0]?.name || "");
+  });
+
+  const Tab = (p) => (
+    <button onClick={() => setTab(p.id)}
+      class="border-b-2 px-3 py-1.5 text-sm"
+      classList={{ "border-sky-400 text-sky-300": tab() === p.id, "border-transparent text-slate-400 hover:text-slate-200": tab() !== p.id }}>
+      {p.label}
+    </button>
+  );
+
   return (
-    <div class="fixed inset-0 z-20 flex justify-end bg-black/40" onClick={props.onClose}>
-      <div
-        class="h-full w-96 overflow-y-auto border-l border-slate-700 bg-[#11151f] p-5"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div class="mb-4 flex items-start justify-between">
-          <div>
-            <div class="text-lg font-semibold text-slate-100">{s.folder.label}</div>
-            <div class="text-xs text-slate-500">
-              {s.folder.id} @ {s.device.name}
-            </div>
-          </div>
+    <div class="fixed inset-x-0 bottom-0 z-20 h-[55vh] border-t border-slate-700 bg-[#0e1220] shadow-2xl flex flex-col">
+      <div class="flex items-center gap-2 border-b border-slate-800 px-4">
+        <span class="mr-2 font-semibold text-slate-100">{folder().label}</span>
+        <span class="text-xs text-slate-500">{folder().id}</span>
+        <div class="ml-3 flex">
+          <Tab id="files" label="Files" />
+          <Tab id="transfers" label="Transfers" />
+          <Tab id="logs" label="Logs" />
+        </div>
+        <div class="ml-auto flex items-center gap-2">
+          <Show when={tab() !== "transfers"}>
+            <label class="text-xs text-slate-500">source</label>
+            <select value={dev()} onChange={(e) => setDev(e.currentTarget.value)}
+              class="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-xs text-slate-200">
+              <For each={presentDevices()}>{(d) => <option value={d.name}>{d.name}</option>}</For>
+            </select>
+          </Show>
           <button onClick={props.onClose} class="text-slate-500 hover:text-slate-200">✕</button>
         </div>
-
-        <dl class="space-y-2 text-sm">
-          <Row k="state" v={c.state} />
-          <Row k="completion" v={pct(c.completion)} />
-          <Row k="need bytes" v={bytes(c.needBytes)} />
-          <Row k="need items" v={c.needItems ?? 0} />
-          <Row k="device id" v={s.device.deviceID ? s.device.deviceID.slice(0, 12) + "…" : "—"} />
-        </dl>
-
-        <Show when={c.errors && c.errors.length}>
-          <div class="mt-4">
-            <div class="mb-1 text-xs font-semibold text-red-300">folder errors</div>
-            <ul class="space-y-1">
-              <For each={c.errors}>
-                {(e) => (
-                  <li class="rounded bg-red-950/60 p-2 text-xs text-red-200">{e}</li>
-                )}
-              </For>
-            </ul>
-          </div>
-        </Show>
-
-        <Show when={s.device.systemErrors && s.device.systemErrors.length}>
-          <div class="mt-4">
-            <div class="mb-1 text-xs font-semibold text-red-300">device system errors</div>
-            <ul class="space-y-1">
-              <For each={s.device.systemErrors}>
-                {(e) => (
-                  <li class="rounded bg-red-950/60 p-2 text-xs text-red-200">{e}</li>
-                )}
-              </For>
-            </ul>
-          </div>
-        </Show>
+      </div>
+      <div class="flex-1 overflow-auto p-4">
+        <Show when={tab() === "files"}><FilesTab node={dev()} folder={folder().id} /></Show>
+        <Show when={tab() === "transfers"}><TransfersTab data={props.data} folder={folder().id} /></Show>
+        <Show when={tab() === "logs"}><LogsTab node={dev()} folder={folder().id} /></Show>
       </div>
     </div>
   );
 }
 
-function Row(props) {
+const isDir = (e) => e.type === "FILE_INFO_TYPE_DIRECTORY" || e.type === "directory";
+
+function FilesTab(props) {
+  const [root] = createResource(() => ({ n: props.node, f: props.folder }),
+    (k) => relay(k.n, "rest/db/browse", { folder: k.f, levels: 1 }));
   return (
-    <div class="flex justify-between border-b border-slate-800 pb-1">
-      <dt class="text-slate-500">{props.k}</dt>
-      <dd class="text-slate-200">{props.v}</dd>
+    <Show when={!root.loading} fallback={<div class="text-slate-500">loading tree…</div>}>
+      <Show when={!root.error} fallback={<div class="text-red-300">{String(root.error)}</div>}>
+        <ul class="font-mono text-[13px]">
+          <For each={root()}>{(e) => <FileNode entry={e} node={props.node} folder={props.folder} path={e.name} depth={0} />}</For>
+        </ul>
+      </Show>
+    </Show>
+  );
+}
+
+function FileNode(props) {
+  const [open, setOpen] = createSignal(false);
+  const [kids] = createResource(open, () =>
+    relay(props.node, "rest/db/browse", { folder: props.folder, prefix: props.path, levels: 1 }));
+  const dir = isDir(props.entry);
+  return (
+    <li>
+      <div class="flex items-center gap-2 rounded px-1 py-0.5 hover:bg-slate-800/60"
+        style={{ "padding-left": props.depth * 16 + "px" }}
+        onClick={() => dir && setOpen(!open())}
+        classList={{ "cursor-pointer": dir }}>
+        <span class="w-4 text-center text-slate-500">{dir ? (open() ? "▾" : "▸") : ""}</span>
+        <span>{dir ? "📁" : "📄"}</span>
+        <span class="text-slate-200">{props.entry.name}</span>
+        <Show when={!dir}><span class="ml-auto text-xs text-slate-500">{bytes(props.entry.size)}</span></Show>
+      </div>
+      <Show when={dir && open()}>
+        <Show when={!kids.loading} fallback={<div class="pl-8 text-xs text-slate-600">…</div>}>
+          <ul><For each={kids()}>{(c) => (
+            <FileNode entry={c} node={props.node} folder={props.folder} path={props.path + "/" + c.name} depth={props.depth + 1} />
+          )}</For></ul>
+        </Show>
+      </Show>
+    </li>
+  );
+}
+
+function TransfersTab(props) {
+  // live per-device status + derived download speed (needBytes delta over time)
+  const [rows, setRows] = createSignal([]);
+  let prev = {}; // name -> {need, t}
+  // only devices that actually have this folder configured (avoids 404 spam)
+  const devices = () => props.data.devices.filter(
+    (d) => (props.data.cells[props.folder] || {})[d.name]?.present);
+
+  async function tick() {
+    const now = Date.now();
+    const out = await Promise.all(devices().map(async (dev) => {
+      const base = { name: dev.name, online: dev.online, present: false };
+      if (!dev.online) return base;
+      try {
+        const st = await relay(dev.name, "rest/db/status", { folder: props.folder });
+        const comp = completion(st.globalBytes, st.needBytes);
+        const p = prev[dev.name];
+        let bps = 0;
+        if (p && st.needBytes < p.need) bps = (p.need - st.needBytes) / ((now - p.t) / 1000);
+        prev[dev.name] = { need: st.needBytes, t: now };
+        return { ...base, present: true, state: st.state, completion: comp,
+          need: st.needBytes, needItems: st.needFiles || 0, global: st.globalBytes, bps };
+      } catch { return base; }
+    }));
+    setRows(out);
+  }
+
+  createEffect(() => {
+    props.folder; // re-run when folder changes
+    prev = {};
+    tick();
+    const id = setInterval(tick, 1500);
+    onCleanup(() => clearInterval(id));
+  });
+
+  const present = () => rows().filter((r) => r.present);
+  const loading = () => present().filter((r) => r.completion < 99.95 || r.state === "syncing");
+  const synced = () => present().filter((r) => !(r.completion < 99.95 || r.state === "syncing"));
+
+  return (
+    <div class="space-y-5">
+      <div>
+        <div class="mb-1 text-xs font-semibold uppercase tracking-wide text-sky-300">loading to ({loading().length})</div>
+        <Show when={loading().length} fallback={<div class="text-sm text-slate-600">nothing transferring</div>}>
+          <For each={loading()}>{(r) => (
+            <div class="mb-2 rounded border border-slate-800 bg-slate-900/40 p-2">
+              <div class="flex items-center gap-2 text-sm">
+                <span class="font-medium text-slate-100">{r.name}</span>
+                <span class="text-xs text-slate-500">{r.state}</span>
+                <span class="ml-auto tabular-nums text-sky-300">{speed(r.bps)}</span>
+              </div>
+              <div class="mt-1 h-2 overflow-hidden rounded bg-slate-800">
+                <div class="h-full bg-sky-500 transition-all" style={{ width: r.completion + "%" }} />
+              </div>
+              <div class="mt-1 flex justify-between text-[11px] text-slate-500">
+                <span>{pct(r.completion)}</span>
+                <span>{bytes(r.need)} · {r.needItems} items left</span>
+              </div>
+            </div>
+          )}</For>
+        </Show>
+      </div>
+      <div>
+        <div class="mb-1 text-xs font-semibold uppercase tracking-wide text-emerald-300">present / in sync ({synced().length})</div>
+        <div class="flex flex-wrap gap-2">
+          <For each={synced()}>{(r) => (
+            <span class="rounded bg-emerald-900/40 px-2 py-1 text-xs text-emerald-200">✓ {r.name} · {bytes(r.global)}</span>
+          )}</For>
+          <For each={rows().filter((r) => !r.online)}>{(r) => (
+            <span class="rounded bg-slate-800/50 px-2 py-1 text-xs text-slate-500">○ {r.name} offline</span>
+          )}</For>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const LOG_LEVEL = { 0: "text-slate-500", 1: "text-slate-400", 2: "text-slate-300", 3: "text-amber-300", 4: "text-red-300" };
+
+function LogsTab(props) {
+  const [errs] = createResource(() => ({ n: props.node, f: props.folder }),
+    (k) => relay(k.n, "rest/folder/errors", { folder: k.f }).then((r) => r.errors || []).catch(() => []));
+  const [log, setLog] = createSignal([]);
+  createEffect(() => {
+    const n = props.node;
+    const pull = () => relay(n, "rest/system/log").then((r) => setLog(r.messages || [])).catch(() => {});
+    pull();
+    const id = setInterval(pull, 4000);
+    onCleanup(() => clearInterval(id));
+  });
+  return (
+    <div class="space-y-3">
+      <Show when={errs() && errs().length}>
+        <div>
+          <div class="mb-1 text-xs font-semibold text-red-300">folder errors</div>
+          <For each={errs()}>{(e) => <div class="rounded bg-red-950/60 p-2 text-xs text-red-200">{e.path}: {e.error}</div>}</For>
+        </div>
+      </Show>
+      <div class="rounded border border-slate-800 bg-black/30 p-2 font-mono text-[12px]">
+        <For each={log().slice(-200).reverse()} fallback={<div class="text-slate-600">no log lines</div>}>
+          {(m) => (
+            <div class={LOG_LEVEL[m.level] || "text-slate-300"}>
+              <span class="text-slate-600">{new Date(m.when).toLocaleTimeString()} </span>{m.message}
+            </div>
+          )}
+        </For>
+      </div>
     </div>
   );
 }

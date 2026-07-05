@@ -2,6 +2,9 @@
 swarm.yaml
 *.local.yaml
 
+# playwright-mcp scratch (browser automation snapshots)
+.playwright-mcp/
+
 # go
 /swarmd
 /bin/

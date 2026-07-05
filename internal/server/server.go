@@ -18,15 +18,26 @@ import (
 var nowFunc = time.Now
 
 type Server struct {
-	cfg *config.Config
-	web fs.FS
+	cfg   *config.Config
+	web   fs.FS
+	nodes map[string]config.Node // name -> node, for the relay proxy
+	proxy *http.Client
 
 	mu   sync.RWMutex
 	snap *aggregate.Snapshot
 }
 
 func New(cfg *config.Config, web fs.FS) *Server {
-	return &Server{cfg: cfg, web: web}
+	nodes := make(map[string]config.Node, len(cfg.Nodes))
+	for _, n := range cfg.Nodes {
+		nodes[n.Name] = n
+	}
+	return &Server{
+		cfg:   cfg,
+		web:   web,
+		nodes: nodes,
+		proxy: &http.Client{Timeout: 12 * time.Second},
+	}
 }
 
 // Run polls forever and serves HTTP until ctx is cancelled.
@@ -39,6 +50,8 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("/api/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("ok"))
 	})
+	// read-only relay: GET /api/node/{name}/rest/... -> that node's syncthing API
+	mux.HandleFunc("GET /api/node/{name}/{path...}", s.handleNodeProxy)
 	if s.web != nil {
 		mux.Handle("/", http.FileServer(http.FS(s.web)))
 	}
