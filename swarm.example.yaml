@@ -19,6 +19,7 @@ nodes:
     url: http://100.104.105.106:8384
     apikey: REPLACE_ME_HETZNER
     root: /srv/syncthing
+    ssh: vps-hetzner              # ssh dest+opts for disk stats, e.g. "-p 2222 host"
 
   - name: phone-pixel
     url: http://100.107.108.109:8384

@@ -16,6 +16,13 @@ type Node struct {
 	APIKey string `yaml:"apikey"`         // per-node X-API-Key
 	Root   string `yaml:"root,omitempty"` // base dir for new shared folders: <root>/<label>
 	Local  bool   `yaml:"local,omitempty"` // the machine we share FROM (defaults to the 127.0.0.1 node)
+	SSH    string `yaml:"ssh,omitempty"`   // ssh destination+opts for disk stats, e.g. "-p 2222 taskbot" (empty = local)
+}
+
+// IsLocal reports whether this node runs on the same host as swarmd (so disk
+// stats come from a local df rather than ssh).
+func (n *Node) IsLocal() bool {
+	return n.Local || strings.Contains(n.URL, "127.0.0.1") || strings.Contains(n.URL, "localhost")
 }
 
 // Config is the whole swarm.yaml.

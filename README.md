@@ -81,6 +81,15 @@ the local node `local: true`. Then:
 Backend: `POST /api/share` / `POST /api/unshare` (guarded writes, separate from
 the read-only relay). Shared logic in `internal/sharing`.
 
+## Disk usage
+
+Syncthing exposes no host disk stats, so swarmd runs `df` per node on a 60s
+ticker — locally for the hub node, over `ssh` for the rest. Set `ssh:` per node
+in `swarm.yaml` (ssh destination + opts, e.g. `ssh: -p 2222 taskbot`); it reports
+the filesystem holding that node's `root` (fallback `/`). Shown as a bar in each
+matrix column header and the settings cards (`GET /api/disk`). No ssh set on a
+remote node → "disk n/a".
+
 ## Roadmap (phases)
 
 1. **MVP** read-only matrix. ✅

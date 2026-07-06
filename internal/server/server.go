@@ -12,6 +12,7 @@ import (
 
 	"github.com/symunona/syncthing-dashboard/internal/aggregate"
 	"github.com/symunona/syncthing-dashboard/internal/config"
+	"github.com/symunona/syncthing-dashboard/internal/diskusage"
 )
 
 // nowFunc is injectable so tests avoid the wall clock.
@@ -25,6 +26,9 @@ type Server struct {
 
 	mu   sync.RWMutex
 	snap *aggregate.Snapshot
+
+	diskMu sync.RWMutex
+	disk   map[string]diskusage.Usage
 }
 
 func New(cfg *config.Config, web fs.FS) *Server {
@@ -44,9 +48,11 @@ func New(cfg *config.Config, web fs.FS) *Server {
 func (s *Server) Run(ctx context.Context) error {
 	s.pollOnce(ctx) // prime immediately
 	go s.pollLoop(ctx)
+	go s.diskLoop(ctx) // disk stats on a slower cadence
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/matrix", s.handleMatrix)
+	mux.HandleFunc("/api/disk", s.handleDisk)
 	mux.HandleFunc("/api/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("ok"))
 	})

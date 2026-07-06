@@ -17,6 +17,12 @@ async function relay(node, restPath, params) {
   return r.json();
 }
 
+async function fetchDisk() {
+  const r = await fetch("/api/disk");
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
 const pct = (n) => (n == null ? "?" : Math.floor(n) + "%");
 function bytes(n) {
   if (!n) return "0 B";
@@ -27,6 +33,24 @@ function bytes(n) {
 }
 const speed = (bps) => (bps > 0 ? bytes(bps) + "/s" : "—");
 const completion = (g, need) => (g <= 0 || need <= 0 ? 100 : Math.max(0, (g - need) / g * 100));
+
+const diskColor = (p) => (p >= 90 ? "bg-red-500" : p >= 75 ? "bg-amber-500" : "bg-emerald-500");
+
+// compact disk usage bar; u = {total,used,avail,pct,mount,err}
+function DiskBar(props) {
+  return (
+    <Show when={props.u} fallback={<span class="text-[10px] text-slate-600">disk —</span>}>
+      <Show when={!props.u.err} fallback={<span class="text-[10px] text-slate-600" title={props.u.err}>disk n/a</span>}>
+        <div title={`${bytes(props.u.avail)} free of ${bytes(props.u.total)} (${props.u.pct}% used) on ${props.u.mount}`}>
+          <div class="h-1.5 w-full overflow-hidden rounded bg-slate-800">
+            <div class={"h-full " + diskColor(props.u.pct)} style={{ width: props.u.pct + "%" }} />
+          </div>
+          <div class="mt-0.5 text-[10px] text-slate-500">{props.u.pct}% · {bytes(props.u.avail)} free</div>
+        </div>
+      </Show>
+    </Show>
+  );
+}
 
 function cellStyle(cell, online) {
   if (!online) return { bg: "bg-slate-800/40 text-slate-600", label: "—" };
@@ -42,13 +66,15 @@ function cellStyle(cell, online) {
 
 export default function App() {
   const [data, { refetch }] = createResource(fetchMatrix);
+  const [disk, { refetch: refetchDisk }] = createResource(fetchDisk);
   const [sel, setSel] = createSignal(null); // {folder, device?, tab?}
   const [view, setView] = createSignal("matrix"); // matrix | settings
   const [shareMode, setShareMode] = createSignal(false);
   const [busy, setBusy] = createSignal(null); // status string
   const [confirm, setConfirm] = createSignal(null); // {folder, target}
   const t = setInterval(refetch, MATRIX_POLL);
-  onCleanup(() => clearInterval(t));
+  const td = setInterval(refetchDisk, 60000);
+  onCleanup(() => { clearInterval(t); clearInterval(td); });
 
   async function action(kind, folder, target) {
     setBusy(`${kind === "share" ? "sharing" : "unsharing"} ${folder.label} → ${target}…`);
@@ -116,12 +142,12 @@ export default function App() {
         </Show>
         <Show when={data()} fallback={<div class="text-slate-500">loading…</div>}>
           <Show when={view() === "settings"} fallback={
-            <Matrix data={data()} sel={sel()} shareMode={shareMode()}
+            <Matrix data={data()} sel={sel()} shareMode={shareMode()} disk={disk()}
               onFolder={(f) => setSel({ folder: f, tab: "files" })}
               onCell={(f, d) => setSel({ folder: f, device: d.name, tab: "transfers" })}
               onShare={doShare} onUnshare={askUnshare} />
           }>
-            <Settings data={data()} />
+            <Settings data={data()} disk={disk()} />
           </Show>
         </Show>
       </div>
@@ -174,6 +200,7 @@ function Matrix(props) {
                         class="text-sky-400 hover:underline" title={"open " + dev.name + " syncthing GUI · " + dev.url}>⚙&nbsp;GUI↗</a>
                     </Show>
                   </div>
+                  <div class="mt-1 w-full font-normal"><DiskBar u={props.disk?.[dev.name]} /></div>
                 </th>
               )}
             </For>
@@ -428,7 +455,7 @@ function Settings(props) {
         <p class="text-sm text-slate-500">Read-only overview of managed nodes (from swarm.yaml). Folder root = where each folder lives on that node's filesystem.</p>
       </div>
       <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-        <For each={props.data.devices}>{(dev) => <DeviceCard dev={dev} />}</For>
+        <For each={props.data.devices}>{(dev) => <DeviceCard dev={dev} disk={props.disk?.[dev.name]} />}</For>
       </div>
     </div>
   );
@@ -448,7 +475,11 @@ function DeviceCard(props) {
         </Show>
       </div>
       <div class="mt-1 break-all font-mono text-[10px] text-slate-600">{props.dev.deviceID || "—"}</div>
-      <div class="mt-2 text-xs">
+      <div class="mt-3">
+        <div class="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-400">disk</div>
+        <DiskBar u={props.disk} />
+      </div>
+      <div class="mt-3 text-xs">
         <span class="text-slate-500">share root: </span>
         <span class="font-mono text-[11px]" classList={{ "text-slate-300": !!props.dev.root, "text-amber-400": !props.dev.root }}>
           {props.dev.root || "(unset — set `root:` in swarm.yaml to share here)"}
