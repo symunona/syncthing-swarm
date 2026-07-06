@@ -1,4 +1,4 @@
-import { createSignal, createResource, createEffect, For, Show, onCleanup, createMemo } from "solid-js";
+import { createSignal, createResource, createEffect, For, Index, Show, onCleanup, createMemo } from "solid-js";
 
 const MATRIX_POLL = 5000;
 
@@ -43,12 +43,13 @@ function cellStyle(cell, online) {
 export default function App() {
   const [data, { refetch }] = createResource(fetchMatrix);
   const [sel, setSel] = createSignal(null); // {folder, device?, tab?}
+  const [view, setView] = createSignal("matrix"); // matrix | settings
   const t = setInterval(refetch, MATRIX_POLL);
   onCleanup(() => clearInterval(t));
 
   return (
     <div class="min-h-screen">
-      <div class="p-6" classList={{ "pb-[58vh]": !!sel() }}>
+      <div class="p-6" classList={{ "pb-[58vh]": !!sel() && view() === "matrix" }}>
         <header class="mb-5 flex items-baseline gap-3">
           <h1 class="text-xl font-semibold text-slate-100">syncthing swarm</h1>
           <Show when={data()}>
@@ -57,20 +58,29 @@ export default function App() {
               polled {new Date(data().generatedAt).toLocaleTimeString()}
             </span>
           </Show>
-          <button onClick={() => refetch()} class="ml-auto rounded bg-slate-700 px-3 py-1 text-xs hover:bg-slate-600">refresh</button>
+          <div class="ml-auto flex items-center gap-2">
+            <button onClick={() => refetch()} class="rounded bg-slate-700 px-3 py-1 text-xs hover:bg-slate-600">refresh</button>
+            <button onClick={() => setView(view() === "settings" ? "matrix" : "settings")} title="settings"
+              class="rounded px-2 py-1 text-base leading-none hover:bg-slate-700"
+              classList={{ "bg-slate-700": view() === "settings" }}>⚙</button>
+          </div>
         </header>
 
         <Show when={data.error}>
           <div class="rounded bg-red-900/60 p-3 text-red-200">cannot reach swarmd: {String(data.error)}</div>
         </Show>
         <Show when={data()} fallback={<div class="text-slate-500">loading…</div>}>
-          <Matrix data={data()} sel={sel()}
-            onFolder={(f) => setSel({ folder: f, tab: "files" })}
-            onCell={(f, d) => setSel({ folder: f, device: d.name, tab: "transfers" })} />
+          <Show when={view() === "settings"} fallback={
+            <Matrix data={data()} sel={sel()}
+              onFolder={(f) => setSel({ folder: f, tab: "files" })}
+              onCell={(f, d) => setSel({ folder: f, device: d.name, tab: "transfers" })} />
+          }>
+            <Settings data={data()} />
+          </Show>
         </Show>
       </div>
 
-      <Show when={sel()}>
+      <Show when={sel() && view() === "matrix"}>
         <Dock sel={sel()} data={data()} onClose={() => setSel(null)} />
       </Show>
     </div>
@@ -97,7 +107,13 @@ function Matrix(props) {
                       <span class="rounded bg-red-600 px-1 text-[10px] text-white" title={dev.systemErrors.join("\n")}>{dev.systemErrors.length}!</span>
                     </Show>
                   </div>
-                  <div class="mt-0.5 text-[10px] font-normal text-slate-500">{dev.version || "—"}</div>
+                  <div class="mt-0.5 flex items-center gap-1.5 text-[10px] font-normal text-slate-500">
+                    <span>{dev.version || "—"}</span>
+                    <Show when={dev.url}>
+                      <a href={dev.url} target="_blank" rel="noreferrer"
+                        class="text-sky-400 hover:underline" title={"open " + dev.name + " syncthing GUI · " + dev.url}>⚙&nbsp;GUI↗</a>
+                    </Show>
+                  </div>
                 </th>
               )}
             </For>
@@ -157,6 +173,10 @@ function Dock(props) {
     folder();
     if (!presentDevices().some((d) => d.name === dev())) setDev(presentDevices()[0]?.name || "");
   });
+  // absolute path of this folder on the selected source node
+  const [folderPath] = createResource(() => ({ n: dev(), f: folder().id }),
+    (k) => (k.n ? relay(k.n, "rest/config/folders")
+      .then((fs) => (fs.find((x) => x.id === k.f) || {}).path || "").catch(() => "") : ""));
 
   const Tab = (p) => (
     <button onClick={() => setTab(p.id)}
@@ -181,12 +201,20 @@ function Dock(props) {
             <label class="text-xs text-slate-500">source</label>
             <select value={dev()} onChange={(e) => setDev(e.currentTarget.value)}
               class="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-xs text-slate-200">
-              <For each={presentDevices()}>{(d) => <option value={d.name}>{d.name}</option>}</For>
+              <Index each={presentDevices()}>{(d) => <option value={d().name}>{d().name}</option>}</Index>
             </select>
           </Show>
           <button onClick={props.onClose} class="text-slate-500 hover:text-slate-200">✕</button>
         </div>
       </div>
+      <Show when={tab() !== "transfers" && folderPath()}>
+        <div class="border-b border-slate-800 px-4 py-1.5 font-mono text-xs">
+          <span class="text-slate-500">📂 </span>
+          <span class="text-sky-300">{dev()}</span>
+          <span class="text-slate-500">:</span>
+          <span class="text-slate-200">{folderPath()}</span>
+        </div>
+      </Show>
       <div class="flex-1 overflow-auto p-4">
         <Show when={tab() === "files"}><FilesTab node={dev()} folder={folder().id} /></Show>
         <Show when={tab() === "transfers"}><TransfersTab data={props.data} folder={folder().id} /></Show>
@@ -312,6 +340,53 @@ function TransfersTab(props) {
           )}</For>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ---------- settings ----------
+
+function Settings(props) {
+  return (
+    <div class="space-y-4">
+      <div>
+        <h2 class="text-lg font-semibold text-slate-100">Settings — devices & folder roots</h2>
+        <p class="text-sm text-slate-500">Read-only overview of managed nodes (from swarm.yaml). Folder root = where each folder lives on that node's filesystem.</p>
+      </div>
+      <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+        <For each={props.data.devices}>{(dev) => <DeviceCard dev={dev} />}</For>
+      </div>
+    </div>
+  );
+}
+
+function DeviceCard(props) {
+  const [folders] = createResource(() => (props.dev.online ? props.dev.name : null),
+    (n) => relay(n, "rest/config/folders").catch(() => []));
+  return (
+    <div class="rounded-lg border border-slate-800 bg-[#11151f] p-4">
+      <div class="flex items-center gap-2">
+        <span class={"h-2 w-2 rounded-full " + (props.dev.online ? "bg-emerald-400" : "bg-slate-600")} />
+        <span class="font-semibold text-slate-100">{props.dev.name}</span>
+        <span class="text-xs text-slate-500">{props.dev.version || "—"}</span>
+        <Show when={props.dev.url}>
+          <a href={props.dev.url} target="_blank" rel="noreferrer" class="ml-auto text-xs text-sky-400 hover:underline">⚙ open GUI ↗</a>
+        </Show>
+      </div>
+      <div class="mt-1 break-all font-mono text-[10px] text-slate-600">{props.dev.deviceID || "—"}</div>
+      <div class="mt-3 text-xs font-semibold uppercase tracking-wide text-slate-400">folder roots</div>
+      <Show when={props.dev.online} fallback={<div class="mt-1 text-xs text-slate-600">offline</div>}>
+        <ul class="mt-1 space-y-1.5">
+          <For each={folders()} fallback={<li class="text-xs text-slate-600">loading…</li>}>
+            {(f) => (
+              <li class="text-xs">
+                <span class="text-slate-300">{f.label || f.id}</span>
+                <div class="break-all font-mono text-[11px] text-slate-500">{f.path}</div>
+              </li>
+            )}
+          </For>
+        </ul>
+      </Show>
     </div>
   );
 }

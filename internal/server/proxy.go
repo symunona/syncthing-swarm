@@ -10,6 +10,7 @@ import (
 // forward. Anything not listed (config writes, restart, shutdown, pause…) is
 // rejected — the relay is read-only until phase 2 adds guarded actions.
 var allowedREST = map[string]bool{
+	"rest/config/folders":     true, // folder paths per node (no secrets; NOT rest/config, which leaks apikey)
 	"rest/db/browse":          true,
 	"rest/db/status":          true,
 	"rest/db/completion":      true,

@@ -29,6 +29,7 @@ type Device struct {
 	Version      string   `json:"version"`
 	Online       bool     `json:"online"`
 	SystemErrors []string `json:"systemErrors"`
+	URL          string   `json:"url"` // syncthing GUI base (for a direct "open GUI" link)
 }
 
 // Folder is a row.
@@ -105,7 +106,7 @@ func pollNode(ctx context.Context, n config.Node) (r struct {
 	folders []stclient.ConfigFolder
 	cells   map[string]Cell
 }) {
-	r.dev = Device{Name: n.Name}
+	r.dev = Device{Name: n.Name, URL: n.URL}
 	r.cells = map[string]Cell{}
 	c := stclient.New(n.URL, n.APIKey)
 
