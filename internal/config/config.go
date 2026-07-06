@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -11,8 +12,10 @@ import (
 // Node is one managed syncthing instance (a "column" in the matrix).
 type Node struct {
 	Name   string `yaml:"name"`
-	URL    string `yaml:"url"`    // GUI/REST base, e.g. http://100.x.y.z:8384
-	APIKey string `yaml:"apikey"` // per-node X-API-Key
+	URL    string `yaml:"url"`            // GUI/REST base, e.g. http://100.x.y.z:8384
+	APIKey string `yaml:"apikey"`         // per-node X-API-Key
+	Root   string `yaml:"root,omitempty"` // base dir for new shared folders: <root>/<label>
+	Local  bool   `yaml:"local,omitempty"` // the machine we share FROM (defaults to the 127.0.0.1 node)
 }
 
 // Config is the whole swarm.yaml.
@@ -52,4 +55,33 @@ func Load(path string) (*Config, error) {
 		seen[n.Name] = true
 	}
 	return &c, nil
+}
+
+// Node returns the node with the given name, or nil.
+func (c *Config) Node(name string) *Node {
+	for i := range c.Nodes {
+		if c.Nodes[i].Name == name {
+			return &c.Nodes[i]
+		}
+	}
+	return nil
+}
+
+// LocalNode is the machine we share folders FROM: the node flagged local, else
+// the one bound to loopback (the hub itself), else the first node.
+func (c *Config) LocalNode() *Node {
+	for i := range c.Nodes {
+		if c.Nodes[i].Local {
+			return &c.Nodes[i]
+		}
+	}
+	for i := range c.Nodes {
+		if strings.Contains(c.Nodes[i].URL, "127.0.0.1") || strings.Contains(c.Nodes[i].URL, "localhost") {
+			return &c.Nodes[i]
+		}
+	}
+	if len(c.Nodes) > 0 {
+		return &c.Nodes[0]
+	}
+	return nil
 }

@@ -52,6 +52,9 @@ func (s *Server) Run(ctx context.Context) error {
 	})
 	// read-only relay: GET /api/node/{name}/rest/... -> that node's syncthing API
 	mux.HandleFunc("GET /api/node/{name}/{path...}", s.handleNodeProxy)
+	// write actions (guarded, explicit — not via the relay)
+	mux.HandleFunc("POST /api/share", s.handleShare)
+	mux.HandleFunc("POST /api/unshare", s.handleUnshare)
 	if s.web != nil {
 		mux.Handle("/", http.FileServer(http.FS(s.web)))
 	}

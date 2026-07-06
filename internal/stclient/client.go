@@ -3,6 +3,7 @@
 package stclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,13 @@ import (
 	"net/url"
 	"time"
 )
+
+// Folder is a syncthing folder config kept as a raw object so we round-trip
+// every field we don't model when copying a folder between nodes.
+type Folder map[string]any
+
+// Device is a syncthing device config kept raw for the same reason.
+type Device map[string]any
 
 // Client talks to a single syncthing instance.
 type Client struct {
@@ -48,6 +56,85 @@ func (c *Client) get(ctx context.Context, path string, q url.Values, out any) er
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// do sends a request with an optional JSON body. found=false on 404 (so callers
+// can tell "not there" from a real error). Returns error on other non-2xx.
+func (c *Client) do(ctx context.Context, method, path string, body any) (found bool, err error) {
+	var rdr *bytes.Reader
+	if body != nil {
+		b, e := json.Marshal(body)
+		if e != nil {
+			return false, e
+		}
+		rdr = bytes.NewReader(b)
+	} else {
+		rdr = bytes.NewReader(nil)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, rdr)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("X-API-Key", c.apiKey)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if resp.StatusCode/100 != 2 {
+		return false, fmt.Errorf("%s %s -> %s", method, path, resp.Status)
+	}
+	return true, nil
+}
+
+// GetFolder returns the folder config, found=false if the node has no such folder.
+func (c *Client) GetFolder(ctx context.Context, id string) (Folder, bool, error) {
+	var f Folder
+	err := c.get(ctx, "/rest/config/folders/"+id, nil, &f)
+	if err != nil {
+		// get() turns 404 into an error string; treat "404" as not-found
+		if err.Error() == "/rest/config/folders/"+id+" -> 404 Not Found" {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return f, true, nil
+}
+
+// ConfigFolders lists all folders as raw objects (into out, a *[]Folder).
+func (c *Client) ConfigFolders(ctx context.Context, out any) error {
+	return c.get(ctx, "/rest/config/folders", nil, out)
+}
+
+// PutFolder creates or replaces a folder (must contain "id").
+func (c *Client) PutFolder(ctx context.Context, f Folder) error {
+	id, _ := f["id"].(string)
+	_, err := c.do(ctx, http.MethodPut, "/rest/config/folders/"+id, f)
+	return err
+}
+
+// DeleteFolder removes a folder from config. Does NOT delete files on disk.
+func (c *Client) DeleteFolder(ctx context.Context, id string) error {
+	_, err := c.do(ctx, http.MethodDelete, "/rest/config/folders/"+id, nil)
+	return err
+}
+
+// HasDevice reports whether the node already knows a device ID.
+func (c *Client) HasDevice(ctx context.Context, deviceID string) (bool, error) {
+	return c.do(ctx, http.MethodGet, "/rest/config/devices/"+deviceID, nil)
+}
+
+// PutDevice adds/updates a device (must contain "deviceID").
+func (c *Client) PutDevice(ctx context.Context, d Device) error {
+	id, _ := d["deviceID"].(string)
+	_, err := c.do(ctx, http.MethodPut, "/rest/config/devices/"+id, d)
+	return err
 }
 
 // --- response shapes (only the fields we use) ---

@@ -44,8 +44,32 @@ export default function App() {
   const [data, { refetch }] = createResource(fetchMatrix);
   const [sel, setSel] = createSignal(null); // {folder, device?, tab?}
   const [view, setView] = createSignal("matrix"); // matrix | settings
+  const [shareMode, setShareMode] = createSignal(false);
+  const [busy, setBusy] = createSignal(null); // status string
+  const [confirm, setConfirm] = createSignal(null); // {folder, target}
   const t = setInterval(refetch, MATRIX_POLL);
   onCleanup(() => clearInterval(t));
+
+  async function action(kind, folder, target) {
+    setBusy(`${kind === "share" ? "sharing" : "unsharing"} ${folder.label} → ${target}…`);
+    try {
+      const r = await fetch("/api/" + kind, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ folder: folder.id, target }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || r.status);
+      setBusy(`${kind === "share" ? "shared" : "unshared"} ${folder.label} → ${target}` +
+        (j.targetPath ? ` (${j.targetPath})` : ""));
+      await refetch();
+      setTimeout(() => setBusy(null), 4000);
+    } catch (e) {
+      setBusy("error: " + String(e.message || e));
+    }
+  }
+  const doShare = (folder, target) => action("share", folder, target);
+  const askUnshare = (folder, target) => setConfirm({ folder, target });
 
   return (
     <div class="min-h-screen">
@@ -59,6 +83,14 @@ export default function App() {
             </span>
           </Show>
           <div class="ml-auto flex items-center gap-2">
+            <Show when={view() === "matrix"}>
+              <button onClick={() => setShareMode(!shareMode())}
+                class="rounded px-3 py-1 text-xs"
+                classList={{ "bg-sky-700 text-white": shareMode(), "bg-slate-700 hover:bg-slate-600": !shareMode() }}
+                title={"toggle share mode — check a box to share " + (data()?.source || "local") + "'s folder to a device"}>
+                {shareMode() ? "☑ share mode" : "share mode"}
+              </button>
+            </Show>
             <button onClick={() => refetch()} class="rounded bg-slate-700 px-3 py-1 text-xs hover:bg-slate-600">refresh</button>
             <button onClick={() => setView(view() === "settings" ? "matrix" : "settings")} title="settings"
               class="rounded px-2 py-1 text-base leading-none hover:bg-slate-700"
@@ -66,22 +98,50 @@ export default function App() {
           </div>
         </header>
 
+        <Show when={shareMode() && view() === "matrix"}>
+          <div class="mb-3 rounded bg-sky-950/40 px-3 py-2 text-xs text-sky-200">
+            Share mode: check a box to share <b>{data()?.source}</b>'s folder to that device (one click);
+            uncheck to stop sharing (asks first, keeps files).
+          </div>
+        </Show>
+        <Show when={busy()}>
+          <div class="mb-3 rounded px-3 py-2 text-xs"
+            classList={{ "bg-red-900/60 text-red-200": busy().startsWith("error"), "bg-slate-800 text-slate-300": !busy().startsWith("error") }}>
+            {busy()}
+          </div>
+        </Show>
+
         <Show when={data.error}>
           <div class="rounded bg-red-900/60 p-3 text-red-200">cannot reach swarmd: {String(data.error)}</div>
         </Show>
         <Show when={data()} fallback={<div class="text-slate-500">loading…</div>}>
           <Show when={view() === "settings"} fallback={
-            <Matrix data={data()} sel={sel()}
+            <Matrix data={data()} sel={sel()} shareMode={shareMode()}
               onFolder={(f) => setSel({ folder: f, tab: "files" })}
-              onCell={(f, d) => setSel({ folder: f, device: d.name, tab: "transfers" })} />
+              onCell={(f, d) => setSel({ folder: f, device: d.name, tab: "transfers" })}
+              onShare={doShare} onUnshare={askUnshare} />
           }>
             <Settings data={data()} />
           </Show>
         </Show>
       </div>
 
-      <Show when={sel() && view() === "matrix"}>
+      <Show when={sel() && view() === "matrix" && !shareMode()}>
         <Dock sel={sel()} data={data()} onClose={() => setSel(null)} />
+      </Show>
+
+      <Show when={confirm()}>
+        <div class="fixed inset-0 z-30 flex items-center justify-center bg-black/50" onClick={() => setConfirm(null)}>
+          <div class="w-96 rounded-lg border border-slate-700 bg-[#11151f] p-5" onClick={(e) => e.stopPropagation()}>
+            <div class="text-slate-100">Stop sharing <b>{confirm().folder.label}</b> to <b>{confirm().target}</b>?</div>
+            <div class="mt-2 text-xs text-slate-400">Removes the folder from {confirm().target}'s config and stops syncing. Files already on disk are kept.</div>
+            <div class="mt-4 flex justify-end gap-2">
+              <button onClick={() => setConfirm(null)} class="rounded bg-slate-700 px-3 py-1 text-sm hover:bg-slate-600">cancel</button>
+              <button onClick={() => { const c = confirm(); setConfirm(null); action("unshare", c.folder, c.target); }}
+                class="rounded bg-red-700 px-3 py-1 text-sm text-white hover:bg-red-600">unshare</button>
+            </div>
+          </div>
+        </div>
       </Show>
     </div>
   );
@@ -135,12 +195,26 @@ function Matrix(props) {
                   {(dev) => {
                     const cell = () => (d().cells[f.id] || {})[dev.name];
                     const s = () => cellStyle(cell(), dev.online);
+                    const isSource = () => dev.name === d().source;
+                    const sourceHas = () => !!(d().cells[f.id] || {})[d().source]?.present;
+                    const shared = () => !!cell()?.present;
                     return (
                       <td class="border-l border-slate-800 p-1 text-center">
-                        <button class={"w-full rounded px-2 py-1.5 text-xs font-medium " + s().bg +
-                          (cell() && cell().present ? " cursor-pointer hover:brightness-125" : " cursor-default")}
-                          disabled={!cell() || !cell().present || !dev.online}
-                          onClick={() => props.onCell(f, dev)}>{s().label}</button>
+                        <Show when={props.shareMode} fallback={
+                          <button class={"w-full rounded px-2 py-1.5 text-xs font-medium " + s().bg +
+                            (cell() && cell().present ? " cursor-pointer hover:brightness-125" : " cursor-default")}
+                            disabled={!cell() || !cell().present || !dev.online}
+                            onClick={() => props.onCell(f, dev)}>{s().label}</button>
+                        }>
+                          <input type="checkbox" class="h-4 w-4 accent-sky-500"
+                            checked={isSource() ? sourceHas() : shared()}
+                            disabled={isSource() || !sourceHas() || !dev.online}
+                            title={isSource() ? d().source + " (source)"
+                              : !sourceHas() ? d().source + " doesn't have this folder"
+                              : !dev.online ? dev.name + " offline"
+                              : shared() ? "shared — uncheck to stop" : "share to " + dev.name}
+                            onChange={(e) => e.currentTarget.checked ? props.onShare(f, dev.name) : props.onUnshare(f, dev.name)} />
+                        </Show>
                       </td>
                     );
                   }}
@@ -374,6 +448,12 @@ function DeviceCard(props) {
         </Show>
       </div>
       <div class="mt-1 break-all font-mono text-[10px] text-slate-600">{props.dev.deviceID || "—"}</div>
+      <div class="mt-2 text-xs">
+        <span class="text-slate-500">share root: </span>
+        <span class="font-mono text-[11px]" classList={{ "text-slate-300": !!props.dev.root, "text-amber-400": !props.dev.root }}>
+          {props.dev.root || "(unset — set `root:` in swarm.yaml to share here)"}
+        </span>
+      </div>
       <div class="mt-3 text-xs font-semibold uppercase tracking-wide text-slate-400">folder roots</div>
       <Show when={props.dev.online} fallback={<div class="mt-1 text-xs text-slate-600">offline</div>}>
         <ul class="mt-1 space-y-1.5">

@@ -22,10 +22,19 @@ web:
     pnpm --dir web install
     pnpm --dir web run build
 
-# compile self-contained binary ./swarmd (UI embedded)
+# compile self-contained binary ./swarmd (UI embedded) + stc CLI
 build: web
     go build -tags embedweb -o swarmd ./cmd/swarmd
-    @echo "built ./swarmd"
+    go build -o stc ./cmd/stc
+    @echo "built ./swarmd and ./stc"
+
+# share a folder from local -> target: just share <folder> <target>
+share folder target:
+    go run ./cmd/stc share {{folder}} {{target}} -config {{config}}
+
+# stop sharing (no confirm): just unshare <folder> <target>
+unshare folder target:
+    go run ./cmd/stc unshare {{folder}} {{target}} -config {{config}}
 
 # run go tests
 test:

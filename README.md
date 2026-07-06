@@ -61,12 +61,32 @@ go build -tags embedweb -o swarmd ./cmd/swarmd
 Syncthing GUI -> Actions -> Settings -> API Key. Or `grep <apikey>` in that
 node config.xml.
 
+## Sharing (share / unshare folders)
+
+Set a `root:` per node in `swarm.yaml` (base dir for new shared folders) and mark
+the local node `local: true`. Then:
+
+- **UI:** toggle **share mode** (top right) -> matrix cells become checkboxes.
+  Check a box to share the local node's folder to that device (one click);
+  uncheck to stop (confirms first, keeps files).
+- **CLI** (`stc`, same swarm.yaml + logic):
+  ```bash
+  stc share   <folder> <target> [-path DIR] [-from NODE]
+  stc unshare <folder> <target>            [-from NODE]   # no confirm
+  # or: just share dropx taskbot   /   just unshare dropx taskbot
+  ```
+  `<folder>` is an id or label; new folder lands at `<target root>/<label>`
+  (or `-path`). **Unshare never deletes files on disk.**
+
+Backend: `POST /api/share` / `POST /api/unshare` (guarded writes, separate from
+the read-only relay). Shared logic in `internal/sharing`.
+
 ## Roadmap (phases)
 
-1. **MVP** read-only matrix. ← here
-2. **Actions** one-click share folder->device (PATCH `/rest/config/folders`,
-   `autoAcceptFolders`), pause/rescan, approve pending devices.
-3. **st-cli** connect/test node, pull logs, add node to swarm.yaml.
+1. **MVP** read-only matrix. ✅
+2. **Actions** one-click share/unshare ✅ (+ relay, detail dock, settings).
+   TODO: pause/rescan, approve pending devices.
+3. **st-cli** `stc share/unshare` ✅. TODO: connect/test node, pull logs, add node.
 4. **Wizard** Tailscale+SSH -> apt install syncthing -> generate config ->
    auto-register into swarm + sharing graph.
 

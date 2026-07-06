@@ -12,11 +12,15 @@ nodes:
   - name: pi-attic
     url: http://100.101.102.103:8384
     apikey: REPLACE_ME_ATTIC
+    local: true                  # the machine you share folders FROM
+    root: /home/pi/syncthing     # new shared folders land in <root>/<label>
 
   - name: vps-hetzner
     url: http://100.104.105.106:8384
     apikey: REPLACE_ME_HETZNER
+    root: /srv/syncthing
 
   - name: phone-pixel
     url: http://100.107.108.109:8384
     apikey: REPLACE_ME_PIXEL
+    # root optional; sharing to a node without root needs an explicit --path

@@ -29,7 +29,8 @@ type Device struct {
 	Version      string   `json:"version"`
 	Online       bool     `json:"online"`
 	SystemErrors []string `json:"systemErrors"`
-	URL          string   `json:"url"` // syncthing GUI base (for a direct "open GUI" link)
+	URL          string   `json:"url"`  // syncthing GUI base (for a direct "open GUI" link)
+	Root         string   `json:"root"` // base dir for new shared folders (from swarm.yaml)
 }
 
 // Folder is a row.
@@ -41,6 +42,7 @@ type Folder struct {
 // Snapshot is the whole matrix at one point in time.
 type Snapshot struct {
 	GeneratedAt time.Time                  `json:"generatedAt"`
+	Source      string                     `json:"source"` // local node we share folders FROM
 	Devices     []Device                   `json:"devices"`
 	Folders     []Folder                   `json:"folders"`
 	Cells       map[string]map[string]Cell `json:"cells"` // folderID -> nodeName -> cell
@@ -52,6 +54,9 @@ func Poll(ctx context.Context, cfg *config.Config, now time.Time) *Snapshot {
 	snap := &Snapshot{
 		GeneratedAt: now,
 		Cells:       map[string]map[string]Cell{},
+	}
+	if l := cfg.LocalNode(); l != nil {
+		snap.Source = l.Name
 	}
 
 	type nodeResult struct {
@@ -106,7 +111,7 @@ func pollNode(ctx context.Context, n config.Node) (r struct {
 	folders []stclient.ConfigFolder
 	cells   map[string]Cell
 }) {
-	r.dev = Device{Name: n.Name, URL: n.URL}
+	r.dev = Device{Name: n.Name, URL: n.URL, Root: n.Root}
 	r.cells = map[string]Cell{}
 	c := stclient.New(n.URL, n.APIKey)
 
