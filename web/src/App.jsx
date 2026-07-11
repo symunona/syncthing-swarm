@@ -153,7 +153,13 @@ export default function App() {
           <Show when={view() === "settings"} fallback={
             <Matrix data={data()} sel={sel()} shareMode={shareMode()} disk={disk()}
               onFolder={(f) => setSel({ folder: f, tab: "files" })}
-              onCell={(f, d) => setSel({ folder: f, device: d.name, tab: "transfers" })}
+              // an errored cell opens straight to the Errors tab — that is what you
+              // clicked it to find out about
+              onCell={(f, d) => {
+                const cell = (data()?.cells?.[f.id] || {})[d.name];
+                const bad = cell && (cell.state === "error" || cell.errors?.length);
+                setSel({ folder: f, device: d.name, tab: bad ? "errors" : "transfers" });
+              }}
               onShare={doShare} onUnshare={askUnshare} />
           }>
             <Settings data={data()} disk={disk()} />
@@ -289,10 +295,17 @@ function Dock(props) {
     (k) => (k.n ? relay(k.n, "rest/config/folders")
       .then((fs) => (fs.find((x) => x.id === k.f) || {}).path || "").catch(() => "") : ""));
 
+  // how many errors this folder has on the selected node — drives the tab badge
+  const errCount = () => ((props.data.cells[folder().id] || {})[dev()] || {}).errors?.length || 0;
+
   const Tab = (p) => (
     <button onClick={() => setTab(p.id)}
       class="border-b-2 px-3 py-1.5 text-sm"
-      classList={{ "border-sky-400 text-sky-300": tab() === p.id, "border-transparent text-slate-400 hover:text-slate-200": tab() !== p.id }}>
+      classList={{
+        "border-sky-400 text-sky-300": tab() === p.id,
+        "border-transparent text-slate-400 hover:text-slate-200": tab() !== p.id,
+        "text-red-300": p.id === "errors" && errCount() > 0 && tab() !== p.id,
+      }}>
       {p.label}
     </button>
   );
@@ -305,6 +318,7 @@ function Dock(props) {
         <div class="ml-3 flex">
           <Tab id="files" label="Files" />
           <Tab id="transfers" label="Transfers" />
+          <Tab id="errors" label={errCount() ? `Errors (${errCount()})` : "Errors"} />
           <Tab id="logs" label="Logs" />
         </div>
         <div class="ml-auto flex items-center gap-2">
@@ -329,6 +343,7 @@ function Dock(props) {
       <div class="flex-1 overflow-auto p-4">
         <Show when={tab() === "files"}><FilesTab node={dev()} folder={folder().id} /></Show>
         <Show when={tab() === "transfers"}><TransfersTab data={props.data} folder={folder().id} /></Show>
+        <Show when={tab() === "errors"}><ErrorsTab node={dev()} folder={folder().id} /></Show>
         <Show when={tab() === "logs"}><LogsTab node={dev()} folder={folder().id} /></Show>
       </div>
     </div>
@@ -512,7 +527,200 @@ function DeviceCard(props) {
   );
 }
 
+// Turn syncthing's raw error strings into something you can act on. Each entry:
+// a title, what it actually means, and what to do about it.
+//
+// The raw message is always shown as well — this explains it, it does not hide it.
+const ERROR_KINDS = [
+  {
+    match: /delete dir:.*directory not empty/i,
+    title: "Local-only files are blocking a directory deletion",
+    what:
+      "Another node deleted this directory, so syncthing tried to delete it here too — but " +
+      "the directory still contains files that exist ONLY on this node. Syncthing refuses to " +
+      "delete files it has never seen anywhere else, so the removal fails and it retries forever.",
+    why:
+      "Usually this means the folder is receive-only and picked up files that were added " +
+      "locally (or survived from an older copy of the folder), while the rest of the swarm " +
+      "moved on and deleted the directory around them. Your files are NOT lost — they are " +
+      "sitting right there, and syncthing is protecting them.",
+    fix: [
+      "Look at what is actually in those directories on this node (Files tab, or ssh in).",
+      "If you WANT to keep them: move them out of the folder, or add them from a node that can send.",
+      "If they are junk left over from an old copy: syncthing's \"Revert local changes\" on a " +
+        "receive-only folder deletes exactly these local-only files and makes the node match the swarm.",
+    ],
+    danger: "\"Revert local changes\" DELETES the local-only files. Look at them first.",
+  },
+  {
+    match: /folder marker missing|marker/i,
+    title: "The folder marker is missing — the drive is probably not mounted",
+    what:
+      "The .stfolder marker lives on the folder's own disk. Syncthing cannot find it, so it has " +
+      "STOPPED this folder instead of treating every missing file as a deletion to propagate.",
+    why: "Almost always an unmounted or dead drive, not a syncthing problem.",
+    fix: [
+      "Check the drive is mounted on that node (the disk bar in the column header will say DRIVE MISSING).",
+      "Mount it, then rescan. Nothing was propagated — syncthing stopped precisely to avoid that.",
+    ],
+  },
+  {
+    match: /no space left|out of (disk )?space/i,
+    title: "The disk is full",
+    what: "Syncthing could not write because the filesystem holding this folder has no free space.",
+    why: "",
+    fix: ["Free space on that node, then rescan. The disk bar in the column header shows how full it is."],
+  },
+  {
+    match: /permission denied|operation not permitted/i,
+    title: "Permission denied",
+    what: "Syncthing cannot read or write these files as the user it runs as.",
+    why:
+      "Usually a uid mismatch: the files on disk are owned by a different user than the one " +
+      "syncthing runs as (common after moving a drive between machines, or restoring a backup).",
+    fix: ["Check the file ownership on that node against the user in the syncthing@<user> unit."],
+  },
+];
+
+function classifyError(msg) {
+  return ERROR_KINDS.find((k) => k.match.test(msg)) || null;
+}
+
 const LOG_LEVEL = { 0: "text-slate-500", 1: "text-slate-400", 2: "text-slate-300", 3: "text-amber-300", 4: "text-red-300" };
+
+// ErrorsTab — what is wrong with this folder on this node, and what to do.
+//
+// Three sources, because they are genuinely different things:
+//   - the FOLDER-level error from /rest/db/status: "folder marker missing" etc.
+//     This is the one that fires when a drive dies, and /rest/folder/errors stays
+//     empty in that case.
+//   - per-file PULL errors from /rest/folder/errors.
+//   - for receive-only folders, LOCAL CHANGES (/rest/db/localchanged): files this
+//     node has that the swarm does not. These are usually the CAUSE of the pull
+//     errors above, so showing them turns a mystery into a diagnosis.
+function ErrorsTab(props) {
+  const key = () => ({ n: props.node, f: props.folder });
+
+  const [status] = createResource(key, (k) =>
+    relay(k.n, "rest/db/status", { folder: k.f }).catch(() => ({})));
+  const [errs] = createResource(key, (k) =>
+    relay(k.n, "rest/folder/errors", { folder: k.f }).then((r) => r.errors || []).catch(() => []));
+  const [cfg] = createResource(key, (k) =>
+    relay(k.n, "rest/config/folders").then((fs) => fs.find((x) => x.id === k.f) || {}).catch(() => ({})));
+  const [local] = createResource(key, (k) =>
+    relay(k.n, "rest/db/localchanged", { folder: k.f }).then((r) => r.files || []).catch(() => []));
+
+  const folderErr = () => status()?.error || "";
+  const anything = () => folderErr() || (errs() || []).length || (local() || []).length;
+
+  return (
+    <div class="space-y-4">
+      <Show when={anything()} fallback={
+        <div class="text-sm text-slate-500">No errors on {props.node}. </div>
+      }>
+        {/* folder-level: the folder has STOPPED */}
+        <Show when={folderErr()}>
+          <Explain title="This folder has stopped" raw={folderErr()} kind={classifyError(folderErr())} />
+        </Show>
+
+        {/* per-file pull errors, grouped by kind so 200 identical errors read as one problem */}
+        <Show when={(errs() || []).length}>
+          <For each={groupErrors(errs())}>{(g) => (
+            <Explain title={g.kind?.title || "Sync error"} kind={g.kind} count={g.items.length}
+              raw={g.items[0].error} items={g.items} node={props.node} />
+          )}</For>
+        </Show>
+
+        {/* receive-only local additions: usually the CAUSE of the errors above */}
+        <Show when={(local() || []).length}>
+          <div class="rounded border border-amber-800 bg-amber-950/30 p-3">
+            <div class="text-sm font-semibold text-amber-200">
+              {local().length} file{local().length === 1 ? "" : "s"} exist only on {props.node}
+            </div>
+            <div class="mt-1 text-xs text-slate-300">
+              This folder is <code>{cfg()?.type || "receive-only"}</code>, so these local files are
+              never sent to the swarm. They are frequently what blocks a directory deletion above.
+              They are not lost — they are only here.
+            </div>
+            <ul class="mt-2 max-h-40 space-y-0.5 overflow-y-auto">
+              <For each={local().slice(0, 100)}>{(f) => (
+                <li class="font-mono text-[11px] text-amber-100/80">{f.name}</li>
+              )}</For>
+            </ul>
+            <Show when={local().length > 100}>
+              <div class="mt-1 text-[11px] text-slate-500">…and {local().length - 100} more</div>
+            </Show>
+          </div>
+        </Show>
+      </Show>
+    </div>
+  );
+}
+
+// groupErrors collapses many identical-shaped errors into one explained block:
+// 200 "directory not empty" lines are ONE problem, not 200.
+function groupErrors(errs) {
+  const groups = [];
+  for (const e of errs || []) {
+    const kind = classifyError(e.error);
+    let g = groups.find((x) => (x.kind ? x.kind.title : x.raw) === (kind ? kind.title : e.error));
+    if (!g) { g = { kind, raw: e.error, items: [] }; groups.push(g); }
+    g.items.push(e);
+  }
+  return groups;
+}
+
+function Explain(props) {
+  return (
+    <div class="rounded border border-red-800 bg-red-950/30 p-3">
+      <div class="flex items-baseline gap-2">
+        <span class="text-sm font-semibold text-red-200">{props.title}</span>
+        <Show when={props.count > 1}>
+          <span class="rounded bg-red-900/70 px-1.5 py-0.5 text-[10px] text-red-200">
+            {props.count} occurrences
+          </span>
+        </Show>
+      </div>
+
+      <Show when={props.kind}>
+        <p class="mt-2 text-xs leading-relaxed text-slate-200">{props.kind.what}</p>
+        <Show when={props.kind.why}>
+          <p class="mt-1.5 text-xs leading-relaxed text-slate-400">{props.kind.why}</p>
+        </Show>
+        <Show when={props.kind.fix?.length}>
+          <div class="mt-2 text-xs font-semibold text-slate-300">What you can do</div>
+          <ul class="mt-1 list-disc space-y-1 pl-5">
+            <For each={props.kind.fix}>{(f) => <li class="text-xs text-slate-300">{f}</li>}</For>
+          </ul>
+        </Show>
+        <Show when={props.kind.danger}>
+          <div class="mt-2 rounded bg-amber-950/50 px-2 py-1 text-[11px] text-amber-200 ring-1 ring-amber-800">
+            ⚠ {props.kind.danger}
+          </div>
+        </Show>
+      </Show>
+
+      {/* the raw message, always — this explains, it does not hide */}
+      <details class="mt-2">
+        <summary class="cursor-pointer text-[11px] text-slate-500 hover:text-slate-300">
+          raw error{props.items?.length > 1 ? ` (${props.items.length} paths)` : ""}
+        </summary>
+        <Show when={props.items} fallback={
+          <div class="mt-1 rounded bg-black/40 p-2 font-mono text-[11px] text-red-200">{props.raw}</div>
+        }>
+          <ul class="mt-1 max-h-48 space-y-1 overflow-y-auto">
+            <For each={props.items}>{(e) => (
+              <li class="rounded bg-black/40 p-2 font-mono text-[11px] text-red-200">
+                <div class="text-red-300">{e.path}</div>
+                <div class="text-slate-400">{e.error}</div>
+              </li>
+            )}</For>
+          </ul>
+        </Show>
+      </details>
+    </div>
+  );
+}
 
 function LogsTab(props) {
   const [errs] = createResource(() => ({ n: props.node, f: props.folder }),

@@ -10,13 +10,18 @@ import (
 // forward. Anything not listed (config writes, restart, shutdown, pause…) is
 // rejected — the relay is read-only until phase 2 adds guarded actions.
 var allowedREST = map[string]bool{
-	"rest/config/folders":     true, // folder paths per node (no secrets; NOT rest/config, which leaks apikey)
-	"rest/db/browse":          true,
-	"rest/db/status":          true,
-	"rest/db/completion":      true,
-	"rest/db/file":            true,
-	"rest/db/need":            true,
-	"rest/folder/errors":      true,
+	"rest/config/folders": true, // folder paths per node (no secrets; NOT rest/config, which leaks apikey)
+	"rest/db/browse":      true,
+	"rest/db/status":      true,
+	"rest/db/completion":  true,
+	"rest/db/file":        true,
+	"rest/db/need":        true,
+	"rest/folder/errors":  true,
+	// files that exist ONLY on this node (receive-only folders). These are usually
+	// the CAUSE of a pull error — "directory not empty" means local-only files are
+	// blocking a deletion — so without this the UI can show the symptom but not
+	// the reason. Read-only, no secrets.
+	"rest/db/localchanged":    true,
 	"rest/system/log":         true,
 	"rest/system/connections": true,
 	"rest/system/version":     true,
