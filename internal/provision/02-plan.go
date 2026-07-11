@@ -35,12 +35,18 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 	// what keeps a spinning disk awake, defeating the rest of this plan.
 	want := wantedWatches(p)
 	if p.Inotify.MaxUserWatches < want {
+		// Don't claim "the drive holds ~0 files" on a box with no drive attached.
+		why := fmt.Sprintf("at %d watches syncthing gives up on watching and falls back to\n"+
+			"    periodic scans, which keep the disk spinning", p.Inotify.MaxUserWatches)
+		if n := inodesOnDrives(p, drives); n > 0 {
+			why = fmt.Sprintf("the drive holds ~%s files; at %d watches syncthing gives up on watching\n"+
+				"    and falls back to periodic scans, which keep the disk spinning",
+				human(n), p.Inotify.MaxUserWatches)
+		}
 		steps = append(steps, Step{
 			ID:    "inotify",
 			Title: fmt.Sprintf("raise inotify watches %d → %d", p.Inotify.MaxUserWatches, want),
-			Why: fmt.Sprintf("the drive holds ~%s files; at %d watches syncthing gives up on watching\n"+
-				"    and falls back to periodic scans, which keep the disk spinning",
-				human(inodesOnDrives(p, drives)), p.Inotify.MaxUserWatches),
+			Why:   why,
 			Cmds: []string{
 				fmt.Sprintf("printf 'fs.inotify.max_user_watches=%d\\n' > /etc/sysctl.d/60-syncthing.conf", want),
 				"sysctl --system >/dev/null",
@@ -110,9 +116,38 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 			done = append(done, fmt.Sprintf("%s is flash — no spindown policy needed", d.Mountpoint))
 			continue
 		}
+
+		// Can this board actually feed that disk?
+		//
+		// This is the check that would have saved rue. A bus-powered 2.5" HDD
+		// spikes ~1A on spin-up; a Pi 1 B+ caps its WHOLE USB bus at 600mA unless
+		// config.txt raises it. hd-idle turns one spin-up at boot into a spin-up
+		// every time the disk is touched — so enabling it on an underpowered board
+		// converts a working node into a box that browns out, corrupts its SD card
+		// mid-write, and never boots again. Which is exactly what happened.
+		if d.USB && p.WeakUSBPower() {
+			steps = append(steps, Step{
+				ID:    "usb-power",
+				Title: "raise the USB current limit (max_usb_current=1)",
+				Why: fmt.Sprintf("%s caps its ENTIRE USB bus at 600mA, and the %s spins up at ~1A.\n"+
+					"    Your power supply is not the bottleneck — the BOARD is. Without this the\n"+
+					"    board browns out on spin-up and corrupts the SD card mid-write.\n"+
+					"    Needs a >=2A supply, and a reboot to take effect",
+					p.Box.Model, d.Device),
+				Warn: "This raises the limit to 1.2A, which is still marginal against a ~1A spin-up.\n" +
+					"     The real fix is a powered USB hub or a Y-cable, so the drive does not\n" +
+					"     draw from the Pi at all.",
+				Cmds: []string{
+					"CFG=/boot/firmware/config.txt; [ -f $CFG ] || CFG=/boot/config.txt; " +
+						"grep -q '^max_usb_current=1' $CFG || printf 'max_usb_current=1\\n' >> $CFG; " +
+						"grep -n max_usb_current $CFG",
+				},
+			})
+		}
+
 		if !p.Spindown.Present {
 			disk := parentDisk(d.Device)
-			steps = append(steps, Step{
+			step := Step{
 				ID:    "hd-idle",
 				Title: fmt.Sprintf("spin %s down after 10min idle (hd-idle)", disk),
 				Why: "hdparm -S sets the DRIVE's own idle timer, and most USB-SATA bridges\n" +
@@ -123,7 +158,26 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 					fmt.Sprintf("printf 'START_HD_IDLE=true\\nHD_IDLE_OPTS=\"-i 0 -a %s -i 600\"\\n' > /etc/default/hd-idle", disk),
 					"systemctl enable --now hd-idle",
 				},
-			})
+			}
+			// A spindown policy on a board that cannot feed the disk is not a
+			// tuning choice, it is a way to destroy the box: every spin-up is a
+			// brownout risk, and a brownout mid-write corrupts the SD card. Make
+			// the user type it out rather than tapping y.
+			if d.USB && p.WeakUSBPower() {
+				step.Warn = "DANGEROUS ON THIS BOARD. " + p.Box.Model + " limits USB to 600mA and this\n" +
+					"     disk spins up at ~1A. hd-idle turns one spin-up at boot into a spin-up\n" +
+					"     every time the disk is touched — each one a brownout risk that can\n" +
+					"     corrupt the SD card mid-write and leave the box unbootable.\n" +
+					"     Apply the max_usb_current step first, and prefer a powered hub.\n" +
+					"     Spin-up/down CYCLES are what age a drive; continuous spinning does not."
+				step.Confirm = "spindown"
+			}
+			if now, ever := p.Power.UnderVoltage(); now || ever {
+				step.Warn += "\n     ⚡ this board HAS ALREADY BROWNED OUT (vcgencmd get_throttled=" +
+					p.Power.Throttled + "). Fix the power before cycling the disk."
+				step.Confirm = "spindown"
+			}
+			steps = append(steps, step)
 		} else {
 			done = append(done, "hd-idle already installed")
 		}
@@ -250,6 +304,19 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 // command; you decide.
 func Findings(p *Probe) []string {
 	var out []string
+
+	// Under-voltage is a hardware fact the Pi records for you. It is the single
+	// most useful thing to know about a Pi with a disk hanging off it, and it is
+	// invisible unless you ask.
+	if now, ever := p.Power.UnderVoltage(); now || ever {
+		when := "has browned out since boot"
+		if now {
+			when = "is browning out RIGHT NOW"
+		}
+		out = append(out, fmt.Sprintf("⚡ under-voltage: this board %s (get_throttled=%s). "+
+			"A brownout mid-write corrupts the SD card. Suspect the USB load first — "+
+			"a bus-powered spinning disk is the usual culprit", when, p.Power.Throttled))
+	}
 	if p.Security.PasswordAuth == "yes" {
 		out = append(out, "sshd accepts passwords — consider: PasswordAuthentication no in "+
 			"/etc/ssh/sshd_config.d/10-hardening.conf (the wizard will NOT do this for you: "+

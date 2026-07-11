@@ -288,6 +288,80 @@ func TestPlanAptWaitsForTheDpkgLock(t *testing.T) {
 	}
 }
 
+// The rule that killed rue.
+//
+// rue was a Pi 1 B+ with a bus-powered 2.5" HDD. The board caps its ENTIRE USB
+// bus at 600mA; the disk spikes ~1A on spin-up. We enabled hd-idle, which turned
+// one spin-up at boot into a spin-up every time the disk was touched. The board
+// browned out, corrupted its SD card mid-write (cmdline.txt became 102 bytes of
+// NUL), and never booted again.
+//
+// The wizard must now: raise the USB limit, and make spindown on such a board a
+// typed confirmation rather than a keystroke.
+func TestPlanWeakUSBPowerBoard(t *testing.T) {
+	p := parseFixture(t, "rue-pi1b.ndjson") // Pi 1 B+, rotational USB disk
+	p.Power = Power{Throttled: "0x0"}       // no max_usb_current set
+
+	if !p.WeakUSBPower() {
+		t.Fatalf("Pi 1 B+ with no max_usb_current should be flagged weak; model=%q", p.Box.Model)
+	}
+	if !p.SpinningUSBDisk() {
+		t.Fatal("rue has a rotational USB disk")
+	}
+
+	steps, _ := Plan(p, "symunona")
+
+	usb := stepByID(steps, "usb-power")
+	if usb == nil {
+		t.Fatal("no max_usb_current step: the board cannot feed its disk and we did nothing")
+	}
+	if !strings.Contains(strings.Join(usb.Cmds, " "), "max_usb_current=1") {
+		t.Error("usb-power step does not set max_usb_current=1")
+	}
+
+	hd := stepByID(steps, "hd-idle")
+	if hd == nil {
+		t.Fatal("no hd-idle step")
+	}
+	if hd.Confirm == "" {
+		t.Error("spindown on an underpowered board is one keystroke away — it must be typed out; " +
+			"this is what destroyed rue")
+	}
+	if !strings.Contains(hd.Warn, "600mA") {
+		t.Errorf("hd-idle warning does not explain the power limit: %q", hd.Warn)
+	}
+
+	// A board that has ALREADY browned out must say so, loudly, and in the findings.
+	brown := parseFixture(t, "rue-pi1b.ndjson")
+	brown.Power = Power{Throttled: "0x50005"} // bit 0 and bit 16 set
+	now, ever := brown.Power.UnderVoltage()
+	if !now || !ever {
+		t.Fatalf("0x50005 should decode as under-voltage now AND since boot; got now=%v ever=%v", now, ever)
+	}
+	if f := strings.Join(Findings(brown), " "); !strings.Contains(f, "under-voltage") {
+		t.Error("a board that has browned out does not report it as a finding")
+	}
+}
+
+// A Pi 3+ provides 1.2A by default and ignores max_usb_current. Do not nag about
+// a limit that does not exist, and do not gate its spindown behind a typed word.
+func TestPlanModernPiIsNotWeak(t *testing.T) {
+	p := parseFixture(t, "rue-pi1b.ndjson")
+	p.Box.Model = "Raspberry Pi 3 Model B Plus Rev 1.3"
+	p.Power = Power{Throttled: "0x0"}
+
+	if p.WeakUSBPower() {
+		t.Error("Pi 3 B+ flagged as weak: it supplies 1.2A by default and has no such knob")
+	}
+	steps, _ := Plan(p, "symunona")
+	if stepByID(steps, "usb-power") != nil {
+		t.Error("planned max_usb_current on a Pi 3, where the setting does nothing")
+	}
+	if hd := stepByID(steps, "hd-idle"); hd != nil && hd.Confirm != "" {
+		t.Error("gated spindown behind a typed word on a board that can actually feed its disk")
+	}
+}
+
 // Flash storage must not get the spinning-disk policy: hd-idle on an SSD is dead
 // weight, and there is nothing to spin down.
 func TestPlanNoSpindownOnFlash(t *testing.T) {
@@ -314,6 +388,7 @@ func TestPlanIdempotentOnProvisionedBox(t *testing.T) {
 	p.Security.Fail2ban = Tool{Present: true, Enabled: "enabled"}
 	p.Security.UnattendedUpgrades = Tool{Present: true, Enabled: "enabled"}
 	p.Spindown = Spindown{Present: true, Enabled: "enabled"}
+	p.Power = Power{Throttled: "0x0", MaxUsbCurrent: "max_usb_current=1"}
 	d := p.Drives()[0]
 	p.Fstab = append(p.Fstab, "UUID="+d.UUID+"\t/mnt/hdd\text4\tdefaults,nofail,noatime\t0\t0")
 	for i := range p.Mounts {

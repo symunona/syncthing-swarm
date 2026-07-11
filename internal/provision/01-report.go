@@ -134,6 +134,19 @@ func summarize(check string, p *Probe) string {
 			return "not installed"
 		}
 		return fmt.Sprintf("%s  unit:%s", shortVersion(p.Syncthing.Version), p.Syncthing.Enabled)
+	case "power":
+		now, ever := p.Power.UnderVoltage()
+		switch {
+		case now:
+			return "⚡ UNDER-VOLTAGE RIGHT NOW (" + p.Power.Throttled + ") — the board is browning out"
+		case ever:
+			return "⚡ has browned out since boot (" + p.Power.Throttled + ")"
+		}
+		s := "no under-voltage recorded"
+		if p.WeakUSBPower() && p.SpinningUSBDisk() {
+			s += "  ← but this board caps USB at 600mA and the disk spins up at ~1A"
+		}
+		return s
 	case "tailscale":
 		return p.Tailscale.IP4
 	case "capacity":

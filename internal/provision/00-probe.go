@@ -152,6 +152,8 @@ func (p *Probe) absorb(ev Event) error {
 		return json.Unmarshal(ev.Data, &p.Spindown)
 	case "syncthing":
 		return json.Unmarshal(ev.Data, &p.Syncthing)
+	case "power":
+		return json.Unmarshal(ev.Data, &p.Power)
 	case "tailscale":
 		return json.Unmarshal(ev.Data, &p.Tailscale)
 	case "capacity":

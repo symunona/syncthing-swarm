@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -89,6 +90,7 @@ type Probe struct {
 	Spindown  Spindown         `json:"spindown"`
 	Syncthing SyncthingState   `json:"syncthing"`
 	Tailscale Tailscale        `json:"tailscale"`
+	Power     Power            `json:"power"`
 	Capacity  []FSCapacity     `json:"capacity"`
 	StFolders []StFolder       `json:"stfolders"`
 	Hash      *HashBench       `json:"hash,omitempty"`
@@ -204,6 +206,29 @@ type SyncthingState struct {
 	Active    string `json:"active"`
 }
 
+// Power is the Raspberry Pi's own under-voltage record — the check that would
+// have caught what killed rue.
+//
+// A bus-powered 2.5" HDD spikes ~1A on spin-up. A Pi 1 B+ caps its ENTIRE USB bus
+// at 600mA unless config.txt sets max_usb_current=1 (which raises it to 1.2A).
+// The board browns out, the SD card is corrupted mid-write, and the box never
+// boots again. hd-idle makes this far worse: it turns one spin-up at boot into a
+// spin-up every time the disk is touched.
+type Power struct {
+	Throttled     string `json:"throttled"`     // vcgencmd get_throttled, e.g. "0x50005"
+	MaxUsbCurrent string `json:"maxUsbCurrent"` // the config.txt line, empty if unset
+}
+
+// UnderVoltage reports whether the board has browned out since boot
+// (bit 0 = under-voltage now, bit 16 = it has happened).
+func (p Power) UnderVoltage() (now, everSinceBoot bool) {
+	v, err := strconv.ParseUint(strings.TrimPrefix(p.Throttled, "0x"), 16, 64)
+	if err != nil {
+		return false, false
+	}
+	return v&(1<<0) != 0, v&(1<<16) != 0
+}
+
 type Tailscale struct {
 	IP4    string `json:"ip4"`
 	Status string `json:"status"`
@@ -303,6 +328,37 @@ func (p *Probe) Drives() []Drive {
 		}
 	}
 	return out
+}
+
+// WeakUSBPower reports a board whose USB bus cannot reliably feed a spinning
+// disk: a Pi 1 or Pi 2 (600mA total across all ports) with max_usb_current unset.
+//
+// Later Pis (3 and up) provide 1.2A by default and ignore the knob. Boards that
+// are not Pis have no such limiter modelled here.
+func (p *Probe) WeakUSBPower() bool {
+	m := strings.ToLower(p.Box.Model)
+	if !strings.Contains(m, "raspberry pi") {
+		return false
+	}
+	// "Raspberry Pi Model B Plus" (Pi 1), "Raspberry Pi 2 Model B", "Raspberry Pi Zero"
+	old := strings.Contains(m, "raspberry pi model") ||
+		strings.Contains(m, "raspberry pi 2") ||
+		strings.Contains(m, "raspberry pi zero")
+	if !old {
+		return false
+	}
+	return !strings.Contains(p.Power.MaxUsbCurrent, "max_usb_current=1")
+}
+
+// SpinningUSBDisk reports a rotational disk hanging off USB — the load that
+// browns these boards out.
+func (p *Probe) SpinningUSBDisk() bool {
+	for _, d := range p.Drives() {
+		if d.Rotational && d.USB {
+			return true
+		}
+	}
+	return false
 }
 
 // Capacity of the filesystem mounted at root, nil if the probe skipped it.

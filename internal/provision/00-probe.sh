@@ -269,6 +269,34 @@ check_spindown() {
 	ok spindown "$_d"
 }
 
+# --- power -------------------------------------------------------------------
+# The Pi records under-voltage in hardware, and this is the check that would have
+# caught what killed rue: a bus-powered 2.5" HDD spikes ~1A on spin-up, while a
+# Pi 1 B+ limits its whole USB bus to 600mA unless config.txt says
+# max_usb_current=1. The board browns out, the SD card is corrupted mid-write,
+# and the box never boots again. Enabling hd-idle turns one spin-up at boot into
+# a spin-up every time the disk is touched — so the wizard must know whether this
+# board can actually feed its disk before it starts cycling it.
+#
+# vcgencmd get_throttled bit 0 = under-voltage NOW, bit 16 = under-voltage has
+# occurred since boot. Costs one fork and is read-only.
+
+check_power() {
+	start
+	have vcgencmd || { skip power "not a Raspberry Pi (no vcgencmd)"; return; }
+	local raw hex usb_max
+	raw=$(vcgencmd get_throttled 2>/dev/null)   # throttled=0x50005
+	hex=${raw#*=}
+	[ -z "$hex" ] && { err power "vcgencmd gave no reading"; return; }
+	# config.txt lives on the boot partition; readable without sudo
+	usb_max=""
+	for c in /boot/firmware/config.txt /boot/config.txt; do
+		[ -r "$c" ] && { usb_max=$(grep -E '^[[:space:]]*max_usb_current' "$c" 2>/dev/null | head -n1); break; }
+	done
+	printf -v _d '{"throttled":%s,"maxUsbCurrent":%s}' "$(jstr "$hex")" "$(jstr "$usb_max")"
+	ok power "$_d"
+}
+
 # --- syncthing / tailscale ---------------------------------------------------
 
 check_syncthing() {
@@ -439,6 +467,7 @@ check_mounts
 check_fstab
 check_security
 check_spindown
+check_power
 check_syncthing
 check_tailscale
 check_capacity
