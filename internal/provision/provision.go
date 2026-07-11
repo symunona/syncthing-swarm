@@ -1,0 +1,363 @@
+// Package provision bootstraps a fresh box into the swarm: probe it read-only,
+// derive a hardening plan, install syncthing, mesh it with every node, and adopt
+// folders already sitting on an intact drive.
+//
+// Stages are numbered files (00-probe, 01-report, …) so the directory listing is
+// the flow. Every stage is a plain function over these types, so a web wizard can
+// later be handlers over the same package — the trick internal/sharing already
+// uses to serve both swarmd and stc without drift.
+package provision
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+)
+
+// --- ssh --------------------------------------------------------------------
+
+// SSH runs commands on the target box. Dest is handed straight to ssh, exactly
+// like the `ssh:` field in swarm.yaml (see internal/diskusage): ~/.ssh/config
+// owns aliases, ports, keys and tailscale. We never parse hostnames or manage
+// keys.
+//
+// All commands ride one ControlMaster socket: a single auth, and no per-command
+// handshake — ~300ms x ~40 commands is real money on a Pi 2. The socket dies
+// with the process.
+type SSH struct {
+	Dest    string // e.g. "rue" or "-p 2222 taskbot"
+	ctlPath string
+}
+
+func NewSSH(dest string) (*SSH, error) {
+	if strings.TrimSpace(dest) == "" {
+		return nil, fmt.Errorf("empty ssh destination")
+	}
+	dir, err := os.MkdirTemp("", "stc-ssh-")
+	if err != nil {
+		return nil, err
+	}
+	return &SSH{Dest: dest, ctlPath: filepath.Join(dir, "ctl")}, nil
+}
+
+// Close tears down the shared connection.
+func (s *SSH) Close() {
+	if s.ctlPath == "" {
+		return
+	}
+	args := append(s.opts(), "-O", "exit")
+	args = append(args, strings.Fields(s.Dest)...)
+	_ = exec.Command("ssh", args...).Run()
+	_ = os.RemoveAll(filepath.Dir(s.ctlPath))
+}
+
+func (s *SSH) opts() []string {
+	return []string{
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=" + s.ctlPath,
+		"-o", "ControlPersist=120",
+		"-o", "ConnectTimeout=10",
+	}
+}
+
+// Command builds an ssh invocation running remote through the remote shell.
+// tty=true allocates a terminal, which sudo needs to prompt for a password.
+func (s *SSH) Command(ctx context.Context, tty bool, remote string) *exec.Cmd {
+	args := s.opts()
+	if tty {
+		args = append(args, "-t")
+	}
+	args = append(args, strings.Fields(s.Dest)...)
+	args = append(args, remote)
+	return exec.CommandContext(ctx, "ssh", args...)
+}
+
+// --- probe types ------------------------------------------------------------
+
+// Probe is everything 00-probe.sh learned about the box. Zero values mean "the
+// check did not run or failed" — consult Checks before trusting a field.
+type Probe struct {
+	Box       Box              `json:"box"`
+	Inotify   Inotify          `json:"inotify"`
+	Disks     []BlockDevice    `json:"disks"`
+	Mounts    []Mount          `json:"mounts"`
+	Fstab     []string         `json:"fstab"`
+	Security  Security         `json:"security"`
+	Spindown  Spindown         `json:"spindown"`
+	Syncthing SyncthingState   `json:"syncthing"`
+	Tailscale Tailscale        `json:"tailscale"`
+	Capacity  []FSCapacity     `json:"capacity"`
+	StFolders []StFolder       `json:"stfolders"`
+	Hash      *HashBench       `json:"hash,omitempty"`
+	Checks    map[string]Check `json:"checks"`
+}
+
+// Check is the outcome of one probe check.
+type Check struct {
+	State string `json:"state"` // ok | skip | err | start
+	MS    int    `json:"ms"`
+	Note  string `json:"note,omitempty"`
+}
+
+type Box struct {
+	Model     string `json:"model"` // "Raspberry Pi 2 Model B Rev 1.1" — SBCs self-identify
+	OS        string `json:"os"`
+	Codename  string `json:"codename"`
+	Arch      string `json:"arch"` // armv7l -> 32-bit, decides the apt repo arch
+	Kernel    string `json:"kernel"`
+	Cores     int    `json:"cores"`
+	MemBytes  int64  `json:"memBytes"`
+	SwapBytes int64  `json:"swapBytes"` // matters on a 512MB Pi: hashing can outgrow RAM
+	Hostname  string `json:"hostname"`
+	User      string `json:"user"`
+	UID       int    `json:"uid"`
+}
+
+type Inotify struct {
+	MaxUserWatches   int `json:"maxUserWatches"`
+	MaxUserInstances int `json:"maxUserInstances"`
+}
+
+// BlockDevice mirrors lsblk -J. Children are partitions: note that TRAN and ROTA
+// live on the parent disk while MOUNTPOINT lives on the partition, which is why
+// callers must walk the tree rather than look at one row.
+type BlockDevice struct {
+	Name       string        `json:"name"`
+	Path       string        `json:"path"`
+	Type       string        `json:"type"`
+	Size       int64         `json:"size"`
+	Rota       bool          `json:"rota"` // true = spinning platter
+	Tran       string        `json:"tran"` // usb | sata | nvme | mmc…
+	Hotplug    bool          `json:"hotplug"`
+	FSType     string        `json:"fstype"`
+	UUID       string        `json:"uuid"`
+	Label      string        `json:"label"`
+	Mountpoint string        `json:"mountpoint"`
+	Model      string        `json:"model"`
+	Children   []BlockDevice `json:"children"`
+}
+
+// Mount mirrors findmnt -J, which nests submounts under their parent — so the
+// external drive arrives as a child of /, not as a top-level row. Probe.Mounts
+// holds the flattened list.
+type Mount struct {
+	Target   string  `json:"target"`
+	Source   string  `json:"source"`
+	FSType   string  `json:"fstype"`
+	Options  string  `json:"options"`
+	Children []Mount `json:"children,omitempty"`
+}
+
+type Security struct {
+	UFW                Tool     `json:"ufw"`
+	Fail2ban           Tool     `json:"fail2ban"`
+	UnattendedUpgrades Tool     `json:"unattendedUpgrades"`
+	Listening          []Socket `json:"listening"`
+	SSHDPort           int      `json:"sshdPort"` // the LIVE port — never assume 22
+	PasswordAuth       string   `json:"passwordAuth"`
+	PermitRootLogin    string   `json:"permitRootLogin"`
+}
+
+type Tool struct {
+	Present bool   `json:"present"`
+	Enabled string `json:"enabled"` // enabled | disabled | not-found | no
+}
+
+type Socket struct {
+	Addr string `json:"addr"`
+	Port int    `json:"port"`
+}
+
+// Exposed reports whether the socket is reachable from off-box. A service on
+// 127.0.0.1 is not a finding; one on 0.0.0.0 or :: is.
+func (s Socket) Exposed() bool {
+	return s.Addr == "0.0.0.0" || s.Addr == "*" || s.Addr == "::" || s.Addr == "[::]"
+}
+
+type Spindown struct {
+	Present bool   `json:"present"`
+	Enabled string `json:"enabled"`
+	Config  string `json:"config"`
+}
+
+type SyncthingState struct {
+	Present   bool   `json:"present"`
+	Version   string `json:"version"`
+	ConfigDir string `json:"configDir"`
+	Unit      string `json:"unit"` // syncthing@<user>.service
+	Enabled   string `json:"enabled"`
+}
+
+type Tailscale struct {
+	IP4    string `json:"ip4"`
+	Status string `json:"status"`
+}
+
+// FSCapacity comes from df, never du: walking the tree for exact numbers costs
+// hours on a USB2 HDD and buys nothing. InodesUsed is an upper bound on the
+// inotify watches syncthing will need; UsedBytes is the initial-scan ETA input.
+type FSCapacity struct {
+	Root        string `json:"root"`
+	SizeBytes   int64  `json:"sizeBytes"`
+	UsedBytes   int64  `json:"usedBytes"`
+	AvailBytes  int64  `json:"availBytes"`
+	InodesTotal int64  `json:"inodesTotal"`
+	InodesUsed  int64  `json:"inodesUsed"`
+}
+
+// StFolder is a directory on the drive carrying a .stfolder marker.
+//
+// ID is almost always empty, and that is not a bug: .stfolder is a bare marker
+// that only proves the drive is mounted. Syncthing keeps the folder ID in its
+// index database — exactly what dies with the SD card. The ID is recovered from
+// the swarm instead, joined to this by Name (see 05-adopt.go).
+type StFolder struct {
+	Path string `json:"path"` // /media/hdd/syncthing/dropx
+	Root string `json:"root"` // /media/hdd
+	ID   string `json:"id"`   // ~always "" — see above
+	Name string `json:"name"` // dropx — the join key against folder labels
+}
+
+type HashBench struct {
+	BytesPerSec int64 `json:"bytesPerSec"`
+	SampleBytes int64 `json:"sampleBytes"`
+}
+
+// --- derived facts ----------------------------------------------------------
+
+// Drive is a filesystem worth putting syncthing folders on: a mounted partition
+// that is not part of the OS install. Rotational drives get the whole aging
+// policy (hd-idle, weekly rescan, noatime); flash gets none of it.
+type Drive struct {
+	Device     string // /dev/sda1
+	Mountpoint string // /mnt/hdd
+	FSType     string
+	UUID       string
+	Rotational bool
+	USB        bool
+	SizeBytes  int64
+	Model      string
+}
+
+// osMount reports whether a mountpoint belongs to the OS install rather than
+// being a data drive.
+//
+// "Is it hotplug/USB?" is the tempting test and it is wrong: on a Raspberry Pi
+// the SD card reports hotplug=true, so that rule hands you the boot media as a
+// syncthing target. Test what we actually care about instead — where it is
+// mounted. This mirrors scan_roots() in 00-probe.sh, so the folder scan and the
+// drive list can never disagree about what counts as a drive.
+func osMount(mp string) bool {
+	switch mp {
+	case "", "/", "/boot", "/home", "/usr", "/var":
+		return true
+	}
+	for _, pre := range []string{"/boot/", "/usr/", "/var/", "/snap/", "/proc", "/sys", "/run", "/dev"} {
+		if strings.HasPrefix(mp, pre) {
+			return true
+		}
+	}
+	return false
+}
+
+// Drives walks the lsblk tree pairing each mounted partition with its parent
+// disk, since the parent carries `tran`/`rota` while the child carries the
+// mountpoint.
+func (p *Probe) Drives() []Drive {
+	var out []Drive
+	for _, disk := range p.Disks {
+		if disk.Type != "disk" {
+			continue
+		}
+		for _, part := range disk.Children {
+			if part.FSType == "" || osMount(part.Mountpoint) {
+				continue
+			}
+			out = append(out, Drive{
+				Device:     part.Path,
+				Mountpoint: part.Mountpoint,
+				FSType:     part.FSType,
+				UUID:       part.UUID,
+				Rotational: disk.Rota,
+				USB:        disk.Tran == "usb",
+				SizeBytes:  part.Size,
+				Model:      strings.TrimSpace(disk.Model),
+			})
+		}
+	}
+	return out
+}
+
+// Capacity of the filesystem mounted at root, nil if the probe skipped it.
+func (p *Probe) CapacityAt(root string) *FSCapacity {
+	for i := range p.Capacity {
+		if p.Capacity[i].Root == root {
+			return &p.Capacity[i]
+		}
+	}
+	return nil
+}
+
+// MountOptions of target, "" if not mounted.
+func (p *Probe) MountOptions(target string) string {
+	for _, m := range p.Mounts {
+		if m.Target == target {
+			return m.Options
+		}
+	}
+	return ""
+}
+
+// InFstab reports whether /etc/fstab already has an entry for this UUID — i.e.
+// whether the drive comes back on its own after a reboot.
+func (p *Probe) InFstab(uuid string) bool {
+	if uuid == "" {
+		return false
+	}
+	for _, line := range p.Fstab {
+		if strings.Contains(line, uuid) {
+			return true
+		}
+	}
+	return false
+}
+
+// ScanETA estimates the one-time initial hash of everything on the drive. This
+// is the number that tells you whether adoption is a coffee break or an
+// overnight job: the scan is hash-bound on a small ARM core, and it transfers
+// nothing over the network.
+func (p *Probe) ScanETA(usedBytes int64) (secs int64, ok bool) {
+	if p.Hash == nil || p.Hash.BytesPerSec <= 0 || usedBytes <= 0 {
+		return 0, false
+	}
+	return usedBytes / p.Hash.BytesPerSec, true
+}
+
+// --- formatting -------------------------------------------------------------
+
+func HumanBytes(b int64) string {
+	const u = 1024
+	if b < u {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(u), 0
+	for n := b / u; n >= u && exp < 5; n /= u {
+		div *= u
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func HumanDuration(secs int64) string {
+	switch {
+	case secs < 60:
+		return fmt.Sprintf("%ds", secs)
+	case secs < 3600:
+		return fmt.Sprintf("%dm", secs/60)
+	default:
+		return fmt.Sprintf("%dh%02dm", secs/3600, (secs%3600)/60)
+	}
+}

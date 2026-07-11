@@ -12,9 +12,9 @@ import (
 // Node is one managed syncthing instance (a "column" in the matrix).
 type Node struct {
 	Name   string `yaml:"name"`
-	URL    string `yaml:"url"`            // GUI/REST base, e.g. http://100.x.y.z:8384
-	APIKey string `yaml:"apikey"`         // per-node X-API-Key
-	Root   string `yaml:"root,omitempty"` // base dir for new shared folders: <root>/<label>
+	URL    string `yaml:"url"`             // GUI/REST base, e.g. http://100.x.y.z:8384
+	APIKey string `yaml:"apikey"`          // per-node X-API-Key
+	Root   string `yaml:"root,omitempty"`  // base dir for new shared folders: <root>/<label>
 	Local  bool   `yaml:"local,omitempty"` // the machine we share FROM (defaults to the 127.0.0.1 node)
 	SSH    string `yaml:"ssh,omitempty"`   // ssh destination+opts for disk stats, e.g. "-p 2222 taskbot" (empty = local)
 }

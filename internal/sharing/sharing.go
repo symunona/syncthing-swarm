@@ -2,9 +2,12 @@
 // Used by both the swarmd HTTP handlers and the stc CLI so the two never drift.
 //
 // Share:   add target device to the source folder + create the folder on the
-//          target at <root>/<label> (or an explicit path). Files sync normally.
+//
+//	target at <root>/<label> (or an explicit path). Files sync normally.
+//
 // Unshare: remove target device from the source folder + delete the folder from
-//          the target's config. NEVER deletes files on disk.
+//
+//	the target's config. NEVER deletes files on disk.
 package sharing
 
 import (

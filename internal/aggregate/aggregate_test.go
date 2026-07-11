@@ -15,11 +15,11 @@ func TestCompletion(t *testing.T) {
 		global, need int64
 		want         float64
 	}{
-		{0, 0, 100},      // empty folder = synced
-		{100, 0, 100},    // fully synced
-		{100, 100, 0},    // nothing yet
-		{100, 25, 75},    // three quarters
-		{100, -5, 100},   // guard: negative need
+		{0, 0, 100},    // empty folder = synced
+		{100, 0, 100},  // fully synced
+		{100, 100, 0},  // nothing yet
+		{100, 25, 75},  // three quarters
+		{100, -5, 100}, // guard: negative need
 	}
 	for _, c := range cases {
 		if got := completion(c.global, c.need); got != c.want {

@@ -29,6 +29,8 @@ func main() {
 		cmdShare(os.Args[2:])
 	case "unshare":
 		cmdUnshare(os.Args[2:])
+	case "bootstrap":
+		cmdBootstrap(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -41,16 +43,20 @@ func usage() {
 	fmt.Fprint(os.Stderr, `stc — syncthing-swarm folder sharing
 
 usage:
-  stc share   <folder> <target> [-path DIR] [-from NODE] [-config FILE]
-  stc unshare <folder> <target>            [-from NODE] [-config FILE]
+  stc share     <folder> <target> [-path DIR] [-from NODE] [-config FILE]
+  stc unshare   <folder> <target>            [-from NODE] [-config FILE]
+  stc bootstrap <ssh-dest>                   [-no-bench]  [-config FILE]
 
-  <folder>  folder id or label (looked up on the source node)
-  <target>  node name to share to / unshare from
-  -from     source node (default: the local/127.0.0.1 node in swarm.yaml)
-  -path     target dir for the new folder (default: <target root>/<label>)
-  -config   swarm.yaml path (default: swarm.yaml)
+  <folder>    folder id or label (looked up on the source node)
+  <target>    node name to share to / unshare from
+  <ssh-dest>  ssh destination of a new node, e.g. rue (uses your ~/.ssh/config)
+  -from       source node (default: the local/127.0.0.1 node in swarm.yaml)
+  -path       target dir for the new folder (default: <target root>/<label>)
+  -no-bench   bootstrap: skip the sha256 benchmark (loses the initial-scan ETA)
+  -config     swarm.yaml path (default: swarm.yaml)
 
 unshare never deletes files on disk. No confirmation prompt.
+bootstrap surveys the box read-only first and changes nothing without a prompt.
 `)
 	os.Exit(2)
 }

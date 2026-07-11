@@ -123,10 +123,19 @@ every realistic layout (`/media/hdd/syncthing/dropx`). `-prune` on the marker
 stops descent into folder contents; the depth cap bounds the walk to dozens of
 directories. Sub-second, even on a spun-down disk (one spin-up, then nothing).
 
-For each hit, read `.stfolder/syncthing-folder.txt` → **folder ID**. Modern
-syncthing writes this file, which makes an intact HDD self-describing. Old
-markers (pre ~v1.6) are empty dirs → fall back to matching the directory name
-against known folder labels.
+**The folder ID is not on disk.** `.stfolder` is a bare marker whose only job is
+to prove the drive is mounted — it stores nothing. (Verified against syncthing
+v1.27.2: the string `syncthing-folder.txt` does not exist in the binary, and the
+docs/forum treat a lost marker as "just `mkdir` it back".) Syncthing keeps the ID
+in its index database — which is precisely what dies with the SD card.
+
+So the ID comes from **the swarm**, joined to what is on the drive by **directory
+name**. Every other node's config carries every folder's ID *and* label, and
+`sharing.Share` creates folders at `<root>/<label>` — so on a drive our own
+tooling populated, the directory name **is** the label. That is the join key.
+
+The probe still reads `.stfolder/syncthing-folder.txt` if present, so that if
+upstream ever starts stamping the ID into the marker we pick it up for free.
 
 ### No deep walks
 
@@ -215,12 +224,35 @@ The whole HDD-aging policy (`hd-idle` + `nofail`/`noatime` + weekly rescan) is
 
 ## Stage 3 — syncthing
 
-- Install from **`apt.syncthing.net`**, not the distro repo (Raspberry Pi OS
-  ships a years-old syncthing; it would out-drift the rest of the swarm).
-- **`systemctl enable --now syncthing@symunona`** — the templated *system* unit
-  from the official `.deb`. Runs as the user, owns files as the user (uid must
-  match what is already on the HDD or adoption causes permission churn), and
-  starts at boot on a headless box with no `loginctl enable-linger` footgun.
+**Install from the upstream release tarball, for every architecture.** Not apt.
+
+This started as "install from `apt.syncthing.net`", which is wrong — and the
+probe caught it on the first real box. `rue` is a **Pi 1 B+ (ARMv6)**, and Debian
+`armhf` requires **ARMv7 + VFPv3**: the apt packages would die with `Illegal
+instruction`. Tested on the box:
+
+| source | result |
+|---|---|
+| `apt.syncthing.net` (armhf) | ✗ ARMv7 — will not run on ARMv6 |
+| Raspbian's own `apt install syncthing` | ✓ runs, but **v1.19.2** vs the swarm's 1.27.2 — permanent drift |
+| **upstream `syncthing-linux-<arch>` tarball** | ✓ **verified running v1.27.12 on rue** |
+
+The tarball also turns out to be the better answer generally, so it is the only
+path — one code path, newest version, works on ARMv6/ARMv7/arm64/x86 alike:
+
+- It **ships its own `syncthing@.service`** systemd unit, so
+  `systemctl enable --now syncthing@symunona` works exactly as it would with the
+  deb: the templated *system* unit, running as the user, owning files as the user
+  (the uid must match what is already on the HDD or adoption causes permission
+  churn), starting at boot with no `loginctl enable-linger` footgun.
+- Tarball installs keep syncthing's **built-in auto-upgrade** enabled (Debian
+  packages disable it), so the box stays current instead of rotting at whatever
+  version we install today. Auto-upgrade needs the binary writable by the user it
+  runs as, so `/usr/local/bin/syncthing` is chowned to that user — not an
+  escalation, since the unit already runs as them.
+- Arch is picked from the probe's `uname -m`: `armv6l`/`armv7l` → `linux-arm`,
+  `aarch64` → `linux-arm64`, `x86_64` → `linux-amd64`.
+- The download is checksum-verified against the release's `sha256sum.txt`.
 - **Bind the GUI to the tailnet IP only** (`tailscale ip -4`), never `0.0.0.0`.
   The dashboard reaches it over the tailnet; nothing on the LAN or a public
   interface can see the API. Biggest security win in the flow, costs nothing.
@@ -240,21 +272,46 @@ The whole HDD-aging policy (`hd-idle` + `nofail`/`noatime` + weekly rescan) is
 ## Stage 5 — adopt folders
 
 The hub already knows every folder ID + label in the fleet (it polls each node's
-`/rest/config`). Cross-referencing that against what the probe found on the drive
-gives three buckets:
+`/rest/config`). Each directory found on the drive is matched against those
+folders on **two independent signals**.
 
-- **known** — ID on disk matches a folder the swarm has → offer to adopt, path
-  pre-filled to where it actually sits on the HDD.
-- **guessed** — empty `.stfolder`, directory name looks like a known label →
-  offer to adopt, but confirm the ID mapping explicitly.
-- **orphan** — folder on disk that nobody in the swarm has → list it, do
-  nothing. Adopting into a fleet with no other copy is a different, riskier
-  operation.
+**Signal 1 — name.** `sharing.Share` creates folders at `<root>/<label>`, so on a
+drive our own tooling populated the directory name *is* the label.
 
-Adopting a known folder means: create it on the new node with its **existing ID**
-at its **existing path**, then add the new device to that folder on every swarm
-node that already has it. Syncthing rescans, hashes what is on disk, finds it
-already matches, and transfers ~nothing. That is the entire point.
+**Signal 2 — structural fingerprint.** `GET /rest/db/browse?folder=<id>&levels=0`
+returns a folder's top-level entries **from the global index**, so any node
+carrying the folder can answer even without holding the files locally. The same
+list on the new box is one `ls -1` of the candidate directory (a single directory
+read — one spin-up, negligible). Jaccard similarity over the two name sets scores
+every (drive-dir × swarm-folder) pair.
+
+Name alone is not enough, and the second signal is what makes adoption safe:
+
+| name | structure | verdict |
+|---|---|---|
+| matches | agrees | **pre-selected**, and the score is shown so you see *why* |
+| differs | agrees strongly | **rename candidate** — surfaced; name-only matching would have silently dropped it |
+| matches | disagrees (~0) | **loud warning, no default** — the coincidental-name case, i.e. the destructive one |
+| — | nothing agrees | **orphan** — listed, never adopted |
+
+The score is **evidence shown to the user, never an auto-decision**: a folder can
+legitimately look empty at top level, or be heavily `.stignore`d. Anything short
+of "name matches and structure agrees" requires an explicit choice. Adopting into
+a fleet that has no other copy of the folder is out of scope — a different, riskier
+operation.
+
+Adopting means: create the folder on the new node with its **existing ID** (from
+the swarm) at its **existing path** (from the probe), then add the new device to
+that folder on every swarm node that already has it. Syncthing rescans, hashes
+what is on disk, finds it already matches, and transfers ~nothing. That is the
+entire point.
+
+**Adopting a directory under the wrong folder ID is the one genuinely destructive
+mistake available in this wizard** — syncthing would treat the existing files as
+foreign and, on `sendreceive`, push them out into a folder they do not belong to.
+Hence: exact matches are pre-selected, everything else requires an explicit
+choice, and the confirmation shows the ID, the label, the path, and the nodes
+that hold it before anything is written.
 
 **Per-folder prompt, default `sendreceive`**, with the tradeoff explained inline
 at the prompt: receive-only means the box can never push a local mistake back out
