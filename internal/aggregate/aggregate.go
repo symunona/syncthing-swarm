@@ -147,6 +147,14 @@ func pollNode(ctx context.Context, n config.Node) (r struct {
 			cell.NeedBytes = st.NeedBytes
 			cell.NeedItems = st.NeedItems
 			cell.Completion = completion(st.GlobalBytes, st.NeedBytes)
+			// The folder-level error — "folder marker missing" when the drive is
+			// gone. /rest/folder/errors carries only per-file pull failures, so a
+			// folder whose whole disk vanished reports none of those: without this
+			// the UI showed a red cell with no reason.
+			if st.Error != "" {
+				cell.Errors = append(cell.Errors, st.Error)
+				cell.State = "error"
+			}
 		}
 		if ferrs, err := c.FolderErrors(ctx, f.ID); err == nil {
 			for _, fe := range ferrs {

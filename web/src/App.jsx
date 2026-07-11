@@ -36,17 +36,26 @@ const completion = (g, need) => (g <= 0 || need <= 0 ? 100 : Math.max(0, (g - ne
 
 const diskColor = (p) => (p >= 90 ? "bg-red-500" : p >= 75 ? "bg-amber-500" : "bg-emerald-500");
 
-// compact disk usage bar; u = {total,used,avail,pct,mount,err}
+// compact disk usage bar; u = {total,used,avail,pct,mount,err,missing}
+//
+// `missing` is loud on purpose: it means the node's share root isn't there, i.e.
+// the drive is gone. This used to render as a healthy green bar, because the
+// backend fell back to df / and reported the boot media instead.
 function DiskBar(props) {
   return (
     <Show when={props.u} fallback={<span class="text-[10px] text-slate-600">disk —</span>}>
-      <Show when={!props.u.err} fallback={<span class="text-[10px] text-slate-600" title={props.u.err}>disk n/a</span>}>
-        <div title={`${bytes(props.u.avail)} free of ${bytes(props.u.total)} (${props.u.pct}% used) on ${props.u.mount}`}>
-          <div class="h-1.5 w-full overflow-hidden rounded bg-slate-800">
-            <div class={"h-full " + diskColor(props.u.pct)} style={{ width: props.u.pct + "%" }} />
+      <Show when={!props.u.missing} fallback={
+        <span class="rounded bg-red-900/70 px-1 py-0.5 text-[10px] font-semibold text-red-200 ring-1 ring-red-500"
+              title={props.u.err}>⚠ DRIVE MISSING</span>
+      }>
+        <Show when={!props.u.err} fallback={<span class="text-[10px] text-slate-600" title={props.u.err}>disk n/a</span>}>
+          <div title={`${bytes(props.u.avail)} free of ${bytes(props.u.total)} (${props.u.pct}% used) on ${props.u.mount}`}>
+            <div class="h-1.5 w-full overflow-hidden rounded bg-slate-800">
+              <div class={"h-full " + diskColor(props.u.pct)} style={{ width: props.u.pct + "%" }} />
+            </div>
+            <div class="mt-0.5 text-[10px] text-slate-500">{props.u.pct}% · {bytes(props.u.avail)} free</div>
           </div>
-          <div class="mt-0.5 text-[10px] text-slate-500">{props.u.pct}% · {bytes(props.u.avail)} free</div>
-        </div>
+        </Show>
       </Show>
     </Show>
   );
@@ -231,6 +240,7 @@ function Matrix(props) {
                           <button class={"w-full rounded px-2 py-1.5 text-xs font-medium " + s().bg +
                             (cell() && cell().present ? " cursor-pointer hover:brightness-125" : " cursor-default")}
                             disabled={!cell() || !cell().present || !dev.online}
+                            title={cell()?.errors?.length ? cell().errors.join("\n") : undefined}
                             onClick={() => props.onCell(f, dev)}>{s().label}</button>
                         }>
                           <input type="checkbox" class="h-4 w-4 accent-sky-500"
@@ -507,6 +517,12 @@ const LOG_LEVEL = { 0: "text-slate-500", 1: "text-slate-400", 2: "text-slate-300
 function LogsTab(props) {
   const [errs] = createResource(() => ({ n: props.node, f: props.folder }),
     (k) => relay(k.n, "rest/folder/errors", { folder: k.f }).then((r) => r.errors || []).catch(() => []));
+  // The folder-level error, separate from the per-file pull errors above. This is
+  // the one that says "folder marker missing" when the drive is gone — and
+  // /rest/folder/errors stays EMPTY in that case, so without this the dock showed
+  // nothing at all for a folder whose whole disk had vanished.
+  const [fatal] = createResource(() => ({ n: props.node, f: props.folder }),
+    (k) => relay(k.n, "rest/db/status", { folder: k.f }).then((r) => r.error || "").catch(() => ""));
   const [log, setLog] = createSignal([]);
   createEffect(() => {
     const n = props.node;
@@ -517,9 +533,22 @@ function LogsTab(props) {
   });
   return (
     <div class="space-y-3">
+      <Show when={fatal()}>
+        <div>
+          <div class="mb-1 text-xs font-semibold text-red-300">folder stopped</div>
+          <div class="rounded bg-red-950/80 p-2 text-xs text-red-100 ring-1 ring-red-500">{fatal()}</div>
+          <Show when={fatal().includes("marker")}>
+            <div class="mt-1 text-[11px] text-slate-400">
+              The <code>.stfolder</code> marker lives on the folder's own disk, so this almost always
+              means the drive is not mounted. Syncthing has stopped this folder rather than treat the
+              missing files as deletions — nothing has been propagated to other nodes.
+            </div>
+          </Show>
+        </div>
+      </Show>
       <Show when={errs() && errs().length}>
         <div>
-          <div class="mb-1 text-xs font-semibold text-red-300">folder errors</div>
+          <div class="mb-1 text-xs font-semibold text-red-300">file errors</div>
           <For each={errs()}>{(e) => <div class="rounded bg-red-950/60 p-2 text-xs text-red-200">{e.path}: {e.error}</div>}</For>
         </div>
       </Show>

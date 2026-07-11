@@ -17,6 +17,19 @@ type Node struct {
 	Root   string `yaml:"root,omitempty"`  // base dir for new shared folders: <root>/<label>
 	Local  bool   `yaml:"local,omitempty"` // the machine we share FROM (defaults to the 127.0.0.1 node)
 	SSH    string `yaml:"ssh,omitempty"`   // ssh destination+opts for disk stats, e.g. "-p 2222 taskbot" (empty = local)
+
+	// Mount is where Root's drive is EXPECTED to be mounted, e.g. /mnt/hdd.
+	// Optional; only meaningful when the root lives on a separate drive.
+	//
+	// It exists to catch a silent failure. When an external drive dies its
+	// mountpoint usually survives as an empty directory on the boot media, so
+	// `df /mnt/hdd/syncthing` cheerfully reports the SD CARD — and the dashboard
+	// draws a healthy disk bar for a drive that is gone. Knowing where the drive
+	// belongs lets us call that what it is: a df that resolves anywhere else
+	// means the drive is not mounted.
+	//
+	// `stc bootstrap` sets this when it provisions a node onto a drive.
+	Mount string `yaml:"mount,omitempty"`
 }
 
 // IsLocal reports whether this node runs on the same host as swarmd (so disk

@@ -86,9 +86,25 @@ the read-only relay). Shared logic in `internal/sharing`.
 Syncthing exposes no host disk stats, so swarmd runs `df` per node on a 60s
 ticker — locally for the hub node, over `ssh` for the rest. Set `ssh:` per node
 in `swarm.yaml` (ssh destination + opts, e.g. `ssh: -p 2222 taskbot`); it reports
-the filesystem holding that node's `root` (fallback `/`). Shown as a bar in each
-matrix column header and the settings cards (`GET /api/disk`). No ssh set on a
-remote node → "disk n/a".
+the filesystem holding that node's `root`. Shown as a bar in each matrix column
+header and the settings cards (`GET /api/disk`). No ssh set on a remote node →
+"disk n/a".
+
+**It never falls back to `/`.** It used to, and that made the bar lie in exactly
+the case it exists for: when an external drive dies, `df <root>` fails, the
+fallback reports the boot media, and you get a healthy green bar for a drive that
+is gone. A missing root is now reported, not papered over.
+
+Set **`mount:`** on any node whose root lives on a separate drive (e.g.
+`mount: /media/hdd`). A dying drive usually leaves its mountpoint behind as an
+empty dir on the SD card, so `df` still resolves — just to the wrong filesystem.
+`mount:` is what lets swarmd tell those apart and show **⚠ DRIVE MISSING**.
+
+The other half of that alarm: syncthing's own folder-level error (`folder marker
+missing`) now reaches the matrix — hover a red cell, or open the folder dock.
+The `.stfolder` marker lives on the folder's own disk, so its absence means the
+drive is not mounted, and syncthing stops the folder instead of propagating the
+missing files as deletions.
 
 ## Roadmap (phases)
 

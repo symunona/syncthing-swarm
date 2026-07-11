@@ -12,25 +12,35 @@ import (
 	"github.com/symunona/syncthing-dashboard/internal/config"
 )
 
-// Usage is the filesystem holding a node's share root (or / as fallback).
+// Usage is the filesystem holding a node's share root.
 type Usage struct {
-	Node  string `json:"node"`
-	Mount string `json:"mount"` // mount point df reported
-	Total int64  `json:"total"` // bytes
-	Used  int64  `json:"used"`
-	Avail int64  `json:"avail"`
-	Pct   int    `json:"pct"` // percent used
-	Err   string `json:"err,omitempty"`
+	Node    string `json:"node"`
+	Mount   string `json:"mount"` // mount point df reported
+	Total   int64  `json:"total"` // bytes
+	Used    int64  `json:"used"`
+	Avail   int64  `json:"avail"`
+	Pct     int    `json:"pct"` // percent used
+	Missing bool   `json:"missing,omitempty"`
+	Err     string `json:"err,omitempty"`
 }
 
-// df of the node's root dir, falling back to / if that path doesn't exist.
+const missingSentinel = "STC_NO_ROOT"
+
+// dfCommand reports the filesystem holding the node's root dir.
+//
+// It deliberately does NOT fall back to `/`. It used to, and that made the
+// dashboard lie in the one scenario the disk bar exists for: when an external
+// drive dies, `df /media/hdd/syncthing` fails, the fallback reports the SD card
+// instead, and the UI draws a healthy bar for a drive that is GONE.
+//
+// A missing root is a finding, not something to paper over.
 func dfCommand(path string) string {
 	if path == "" {
 		path = "/"
 	}
 	q := "'" + strings.ReplaceAll(path, "'", "") + "'"
-	base := "df -B1 --output=size,used,avail,pcent,target "
-	return base + q + " 2>/dev/null || " + base + "/"
+	return "test -d " + q + " || { echo " + missingSentinel + "; exit 0; }; " +
+		"df -B1 --output=size,used,avail,pcent,target " + q
 }
 
 // Collect returns disk usage for one node.
@@ -51,11 +61,36 @@ func Collect(ctx context.Context, n config.Node) Usage {
 	if err != nil {
 		return Usage{Node: n.Name, Err: strings.TrimSpace(errText(err))}
 	}
+	if strings.Contains(string(out), missingSentinel) {
+		// Loud only when a drive is genuinely expected. A node whose root simply
+		// hasn't been created yet (no `mount:` declared, root on the main
+		// filesystem) is a missing directory, not a dead disk — crying "DRIVE
+		// MISSING" at that would train you to ignore the alarm that matters.
+		u := Usage{Node: n.Name, Err: fmt.Sprintf("%s does not exist", n.Root)}
+		if n.Mount != "" {
+			u.Missing = true
+			u.Err = fmt.Sprintf("%s does not exist — drive not mounted at %s?", n.Root, n.Mount)
+		}
+		return u
+	}
 	u, perr := parse(out)
 	if perr != nil {
 		return Usage{Node: n.Name, Err: perr.Error()}
 	}
 	u.Node = n.Name
+
+	// The mountpoint usually outlives the drive: /mnt/hdd stays behind as an
+	// empty dir on the boot media, so df silently reports the SD card and the bar
+	// looks healthy. If the node told us where its drive belongs, hold df to it.
+	if n.Mount != "" && u.Mount != n.Mount {
+		return Usage{
+			Node:    n.Name,
+			Mount:   u.Mount,
+			Missing: true,
+			Err: fmt.Sprintf("drive not mounted: expected %s, but %s is on %s",
+				n.Mount, n.Root, u.Mount),
+		}
+	}
 	return u
 }
 

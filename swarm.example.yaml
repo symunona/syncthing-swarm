@@ -20,6 +20,12 @@ nodes:
     apikey: REPLACE_ME_HETZNER
     root: /srv/syncthing
     ssh: vps-hetzner              # ssh dest+opts for disk stats, e.g. "-p 2222 host"
+    mount: /srv                   # OPTIONAL: where root's drive belongs.
+    # Set this on any node whose root lives on a separate drive. When a drive
+    # dies its mountpoint usually survives as an empty dir on the boot media, so
+    # `df` silently reports the SD card and the dashboard would draw a healthy
+    # bar for a drive that is GONE. With `mount:` set, a df that resolves
+    # anywhere else is reported as ⚠ DRIVE MISSING instead.
 
   - name: phone-pixel
     url: http://100.107.108.109:8384

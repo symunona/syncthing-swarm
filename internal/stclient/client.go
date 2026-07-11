@@ -176,6 +176,13 @@ type DBStatus struct {
 	NeedBytes   int64  `json:"needBytes"`
 	NeedItems   int64  `json:"needItems"`
 	Errors      int    `json:"errors"`
+
+	// Error is the folder-level error, and it is the one that matters when a
+	// drive dies: "folder marker missing (this indicates potential data loss…)".
+	// It is NOT the same as /rest/folder/errors, which only carries per-file pull
+	// failures — so a folder whose whole disk vanished reports zero of those.
+	// Without this field the UI showed a red cell with no reason.
+	Error string `json:"error"`
 }
 
 type FolderError struct {
