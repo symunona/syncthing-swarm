@@ -18,7 +18,18 @@ import (
 func Apply(ctx context.Context, s *SSH, step Step, out io.Writer) error {
 	script := buildScript(step)
 	cmd := s.Command(ctx, true, "sudo sh -c "+shellQuote(script))
-	cmd.Stdin = os.Stdin // sudo prompts here
+
+	// Hand stdin to the remote ONLY when it is a real terminal — that is the case
+	// where sudo needs to prompt, and where the tty is shared rather than consumed.
+	//
+	// When stdin is a pipe (scripted run, CI), the remote must NOT get it: ssh
+	// forwards stdin to the remote command, so an earlier step would swallow the
+	// input meant for a LATER prompt. That is not hypothetical — it ate the typed
+	// "ufw" confirmation on the first real run, silently skipping the step. The
+	// mirror of that bug is worse: a queued "y" being fed into a remote program.
+	if isTerminal(os.Stdin) {
+		cmd.Stdin = os.Stdin
+	}
 	cmd.Stdout = prefixWriter(out, "    │ ")
 	cmd.Stderr = prefixWriter(out, "    │ ")
 	if err := cmd.Run(); err != nil {
@@ -37,7 +48,9 @@ func Apply(ctx context.Context, s *SSH, step Step, out io.Writer) error {
 //
 // `set -e` covers the same ground for anything that slips through.
 func buildScript(step Step) string {
-	return "set -e; " + strings.Join(step.Cmds, " && ")
+	// DEBIAN_FRONTEND=noninteractive: these run on a headless box over ssh, and a
+	// debconf prompt with nobody to answer it hangs the step forever.
+	return "export DEBIAN_FRONTEND=noninteractive; set -e; " + strings.Join(step.Cmds, " && ")
 }
 
 // prefixWriter indents remote output so it is visibly the box talking, not us.

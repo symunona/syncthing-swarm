@@ -104,16 +104,15 @@ func summarize(check string, p *Probe) string {
 				miss = append(miss, d.Mountpoint+": no UUID entry (will NOT survive reboot)")
 				continue
 			}
-			opts := p.MountOptions(d.Mountpoint)
+			// the fstab LINE, not the live mount: nofail never appears in /proc/mounts
 			var lacks []string
-			if !strings.Contains(opts, "nofail") {
-				lacks = append(lacks, "nofail")
-			}
-			if !strings.Contains(opts, "noatime") {
-				lacks = append(lacks, "noatime")
+			for _, o := range []string{"nofail", "noatime"} {
+				if !p.FstabHasOption(d.UUID, o) {
+					lacks = append(lacks, o)
+				}
 			}
 			if len(lacks) > 0 {
-				miss = append(miss, fmt.Sprintf("%s: missing %s", d.Mountpoint, strings.Join(lacks, "+")))
+				miss = append(miss, fmt.Sprintf("%s: fstab missing %s", d.Mountpoint, strings.Join(lacks, "+")))
 			}
 		}
 		if len(miss) == 0 {

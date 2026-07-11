@@ -70,18 +70,38 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 				},
 			})
 		} else {
-			opts := p.MountOptions(d.Mountpoint)
+			// Check the FSTAB LINE, not the live mount options: nofail and
+			// x-systemd.device-timeout are consumed by systemd at mount time and
+			// never appear in /proc/mounts, so testing the live options reported
+			// "missing nofail" on a drive whose fstab line plainly had it.
 			var lacks []string
 			for _, o := range []string{"nofail", "noatime"} {
-				if !strings.Contains(opts, o) {
+				if !p.FstabHasOption(d.UUID, o) {
 					lacks = append(lacks, o)
 				}
 			}
 			if len(lacks) > 0 {
-				done = append(done, fmt.Sprintf("%s in fstab, but missing %s (edit by hand: %s)",
-					d.Mountpoint, strings.Join(lacks, "+"), "/etc/fstab"))
+				done = append(done, fmt.Sprintf("%s in fstab, but missing %s — edit /etc/fstab by hand",
+					d.Mountpoint, strings.Join(lacks, "+")))
 			} else {
 				done = append(done, fmt.Sprintf("%s in fstab with nofail+noatime", d.Mountpoint))
+			}
+
+			// noatime IS a live mount option, and an fstab edit does not apply to
+			// an already-mounted filesystem. Without a remount the drive keeps
+			// writing an access timestamp for every file read — which on a
+			// spinning disk means read traffic keeps waking it up, quietly
+			// undoing the whole spindown policy until the next reboot.
+			if p.FstabHasOption(d.UUID, "noatime") && !strings.Contains(p.MountOptions(d.Mountpoint), "noatime") {
+				steps = append(steps, Step{
+					ID:    "remount",
+					Title: fmt.Sprintf("remount %s to pick up noatime", d.Mountpoint),
+					Why: "fstab says noatime but the live mount does not have it — an fstab edit\n" +
+						"    does not apply to an already-mounted filesystem. Until this is\n" +
+						"    remounted, every file READ writes an access timestamp, which keeps\n" +
+						"    waking the disk and undoes the spindown policy",
+					Cmds: []string{"mount -o remount " + d.Mountpoint},
+				})
 			}
 		}
 
@@ -99,7 +119,7 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 					"    silently swallow it — you set it, hdparm says OK, the disk never sleeps.\n" +
 					"    hd-idle watches /proc/diskstats and issues the sleep itself",
 				Cmds: []string{
-					"apt-get install -y hd-idle",
+					aptGet("install -y hd-idle"),
 					fmt.Sprintf("printf 'START_HD_IDLE=true\\nHD_IDLE_OPTS=\"-i 0 -a %s -i 600\"\\n' > /etc/default/hd-idle", disk),
 					"systemctl enable --now hd-idle",
 				},
@@ -125,7 +145,19 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 				fmt.Sprint(port) + " and the tailscale0 rule are applied first, and the enable is last.",
 			Confirm: "ufw",
 			Cmds: []string{
-				"apt-get install -y ufw",
+				aptGet("install -y ufw"),
+				// ufw is only as good as the iptables underneath it, and on an old
+				// ARMv6 Pi the nf_tables backend is broken outright — even
+				// `iptables -L` dies with "target extension not found". ufw then
+				// fails to apply ANY rule while still reporting itself enabled,
+				// which is the worst of both worlds: you believe you have a
+				// firewall and you have nothing. Fall back to the legacy backend
+				// when the default one cannot even list a chain.
+				"iptables -L -n >/dev/null 2>&1 || { " +
+					"echo 'nf_tables backend broken — switching iptables to legacy'; " +
+					"update-alternatives --set iptables /usr/sbin/iptables-legacy && " +
+					"update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy; }",
+				"iptables -L -n >/dev/null", // hard stop if it is STILL broken: never "enable" a firewall that cannot filter
 				"ufw default deny incoming",
 				"ufw default allow outgoing",
 				// ssh FIRST. If this line fails, the enable below must not run —
@@ -140,22 +172,45 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 		done = append(done, "ufw present ("+p.Security.UFW.Enabled+")")
 	}
 
-	if !p.Security.Fail2ban.Present {
+	// fail2ban's sshd jail defaults to reading /var/log/auth.log — which does not
+	// exist on Debian 12, because bookworm ships no rsyslog and logs to the
+	// journal. Out of the box it installs, enables itself, and then DIES with
+	// "Have not found any log file for sshd jail". So configure the journal
+	// backend up front, and repair a box where this already happened.
+	f2bCmds := []string{
+		"printf '[sshd]\\nenabled = true\\nbackend = systemd\\n' > /etc/fail2ban/jail.local",
+		"systemctl enable fail2ban",
+		"systemctl restart fail2ban",
+		// Do not declare victory on a service that is not running.
+		"systemctl is-active --quiet fail2ban",
+		"fail2ban-client status sshd",
+	}
+	switch {
+	case !p.Security.Fail2ban.Present:
 		why := "sshd is reachable from the network; fail2ban bans repeat offenders"
 		if p.Security.PasswordAuth == "yes" {
 			why = "sshd is reachable AND accepts passwords; fail2ban bans repeat offenders"
 		}
 		steps = append(steps, Step{
 			ID:    "fail2ban",
-			Title: "install fail2ban",
-			Why:   why,
-			Cmds: []string{
-				"apt-get install -y fail2ban",
-				"systemctl enable --now fail2ban",
-			},
+			Title: "install fail2ban (journal backend)",
+			Why: why + "\n" +
+				"    Debian 12 has no rsyslog and thus no /var/log/auth.log, which fail2ban's\n" +
+				"    sshd jail reads by default — so it installs, enables, and then crashes.\n" +
+				"    Point it at the journal instead",
+			Cmds: append([]string{aptGet("install -y fail2ban")}, f2bCmds...),
 		})
-	} else {
-		done = append(done, "fail2ban present ("+p.Security.Fail2ban.Enabled+")")
+	case p.Security.Fail2ban.Broken():
+		steps = append(steps, Step{
+			ID:    "fail2ban-repair",
+			Title: "repair fail2ban (installed, but crashed)",
+			Why: "fail2ban is installed and enabled but the service is FAILED — almost always\n" +
+				"    the missing /var/log/auth.log on Debian 12. Installed is not running:\n" +
+				"    right now this box has no brute-force protection at all",
+			Cmds: f2bCmds,
+		})
+	default:
+		done = append(done, "fail2ban present and "+p.Security.Fail2ban.Active)
 	}
 
 	if !p.Security.UnattendedUpgrades.Present {
@@ -164,7 +219,7 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 			Title: "install unattended-upgrades",
 			Why:   "an unpatched box on a tailnet is still an unpatched box",
 			Cmds: []string{
-				"apt-get install -y unattended-upgrades",
+				aptGet("install -y unattended-upgrades"),
 				"printf 'APT::Periodic::Update-Package-Lists \"1\";\\nAPT::Periodic::Unattended-Upgrade \"1\";\\n' > /etc/apt/apt.conf.d/20auto-upgrades",
 				"systemctl enable --now unattended-upgrades",
 			},
@@ -174,13 +229,15 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 	}
 
 	// apt-get update once, before any install, if we're installing anything.
+	// NB: match on "install", not "apt-get install" — aptGet() splices options
+	// between the two words, and matching the literal silently dropped this step.
 	for _, s := range steps {
-		if strings.Contains(strings.Join(s.Cmds, " "), "apt-get install") {
+		if strings.Contains(strings.Join(s.Cmds, " "), "install -y") {
 			steps = append([]Step{{
 				ID:    "apt-update",
 				Title: "apt-get update",
 				Why:   "package lists must be fresh or the installs below fail on a stale index",
-				Cmds:  []string{"apt-get update"},
+				Cmds:  []string{aptGet("update")},
 			}}, steps...)
 			break
 		}
@@ -237,6 +294,17 @@ func inodesOnDrives(p *Probe, drives []Drive) int64 {
 		}
 	}
 	return n
+}
+
+// aptGet builds an apt-get command that WAITS for the dpkg lock rather than
+// dying on it.
+//
+// This is not theoretical: enabling unattended-upgrades makes it immediately
+// start its own apt run, which held the lock and killed the very next step of
+// our own plan. Any box that auto-updates can do this to you at any moment.
+// DPkg::Lock::Timeout makes apt block instead (apt >= 2.0; bookworm has 2.6).
+func aptGet(args string) string {
+	return "apt-get -o DPkg::Lock::Timeout=300 " + args
 }
 
 // parentDisk turns /dev/sda1 into /dev/sda: hd-idle spins down disks, not

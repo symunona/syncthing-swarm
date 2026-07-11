@@ -178,11 +178,42 @@ svc_state() {
 	jstr not-found
 }
 
+# ACTIVE maps unit -> active state, filled by one systemctl call.
+#
+# "enabled" is a symlink and can be read for free; "active" cannot — and the
+# difference matters. fail2ban installed, enabled, and then CRASHED on startup
+# (bookworm ships no rsyslog, so its sshd jail found no /var/log/auth.log), and a
+# probe that only read the symlink cheerfully called it done. Installed is not
+# running.
+#
+# One `systemctl is-active u1 u2 …` prints one line per unit, in order, even for
+# units that do not exist — so this costs a single fork, not five.
+declare -A ACTIVE
+init_active() {
+	have systemctl || return 0
+	local units out u
+	units="ufw.service fail2ban.service unattended-upgrades.service hd-idle.service syncthing@$(id -un).service"
+	out=$(systemctl is-active $units 2>/dev/null)
+	set -- $units
+	while IFS= read -r line; do
+		[ -z "${1:-}" ] && break
+		ACTIVE["$1"]=$line
+		shift
+	done <<-EOF
+		$out
+	EOF
+}
+
+svc_active() {
+	printf '%s' "${ACTIVE[$1]:-unknown}"
+}
+
 tool_json() {
 	# {"present":bool,"enabled":"..","active":".."}
 	local bin=$1 unit=$2 present=false
 	have "$bin" && present=true
-	printf '{"present":%s,"enabled":%s}' "$present" "$(svc_state "$unit")"
+	printf '{"present":%s,"enabled":%s,"active":%s}' \
+		"$present" "$(svc_state "$unit")" "$(jstr "$(svc_active "$unit")")"
 }
 
 check_security() {
@@ -233,8 +264,8 @@ check_spindown() {
 	local present=false conf=""
 	have hd-idle && present=true
 	[ -r /etc/default/hd-idle ] && conf=$(grep -vE '^[[:space:]]*(#|$)' /etc/default/hd-idle 2>/dev/null | tr '\n' ' ')
-	printf -v _d '{"present":%s,"enabled":%s,"config":%s}' \
-		"$present" "$(svc_state hd-idle.service)" "$(jstr "$conf")"
+	printf -v _d '{"present":%s,"enabled":%s,"active":%s,"config":%s}' \
+		"$present" "$(svc_state hd-idle.service)" "$(jstr "$(svc_active hd-idle.service)")" "$(jstr "$conf")"
 	ok spindown "$_d"
 }
 
@@ -251,9 +282,10 @@ check_syncthing() {
 	for d in "$HOME/.local/state/syncthing" "$HOME/.config/syncthing"; do
 		[ -f "$d/config.xml" ] && { cfg=$d; break; }
 	done
-	printf -v _d '{"present":%s,"version":%s,"configDir":%s,"unit":%s,"enabled":%s}' \
+	printf -v _d '{"present":%s,"version":%s,"configDir":%s,"unit":%s,"enabled":%s,"active":%s}' \
 		"$present" "$(jstr "$ver")" "$(jstr "$cfg")" \
-		"$(jstr "syncthing@$user.service")" "$(svc_state "syncthing@$user.service")"
+		"$(jstr "syncthing@$user.service")" "$(svc_state "syncthing@$user.service")" \
+		"$(jstr "$(svc_active "syncthing@$user.service")")"
 	ok syncthing "$_d"
 }
 
@@ -397,6 +429,8 @@ check_hash() {
 }
 
 # --- run ---------------------------------------------------------------------
+
+init_active
 
 check_box
 check_inotify

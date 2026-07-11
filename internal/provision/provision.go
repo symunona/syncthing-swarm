@@ -163,8 +163,19 @@ type Security struct {
 
 type Tool struct {
 	Present bool   `json:"present"`
-	Enabled string `json:"enabled"` // enabled | disabled | not-found | no
+	Enabled string `json:"enabled"` // enabled | disabled | not-found
+	Active  string `json:"active"`  // active | inactive | failed | unknown
 }
+
+// Broken reports a service that is installed but crashed on startup.
+//
+// Installed and enabled is NOT the same as running, and conflating them hid a
+// real failure: fail2ban installed, enabled itself, then died because bookworm
+// ships no rsyslog and its sshd jail found no /var/log/auth.log. The wizard
+// reported it as done. Only "failed" is treated as broken — "inactive" is
+// legitimate for oneshot units like ufw.service, which applies its rules and
+// exits.
+func (t Tool) Broken() bool { return t.Present && t.Active == "failed" }
 
 type Socket struct {
 	Addr string `json:"addr"`
@@ -180,6 +191,7 @@ func (s Socket) Exposed() bool {
 type Spindown struct {
 	Present bool   `json:"present"`
 	Enabled string `json:"enabled"`
+	Active  string `json:"active"`
 	Config  string `json:"config"`
 }
 
@@ -189,6 +201,7 @@ type SyncthingState struct {
 	ConfigDir string `json:"configDir"`
 	Unit      string `json:"unit"` // syncthing@<user>.service
 	Enabled   string `json:"enabled"`
+	Active    string `json:"active"`
 }
 
 type Tailscale struct {
@@ -315,15 +328,32 @@ func (p *Probe) MountOptions(target string) string {
 // InFstab reports whether /etc/fstab already has an entry for this UUID — i.e.
 // whether the drive comes back on its own after a reboot.
 func (p *Probe) InFstab(uuid string) bool {
+	_, ok := p.FstabEntry(uuid)
+	return ok
+}
+
+// FstabEntry returns the fstab line for a UUID.
+func (p *Probe) FstabEntry(uuid string) (string, bool) {
 	if uuid == "" {
-		return false
+		return "", false
 	}
 	for _, line := range p.Fstab {
 		if strings.Contains(line, uuid) {
-			return true
+			return line, true
 		}
 	}
-	return false
+	return "", false
+}
+
+// FstabHasOption reports whether the fstab entry carries a mount option.
+//
+// Check the FSTAB LINE, not the live mount options: `nofail` and
+// `x-systemd.device-timeout` are consumed by systemd at mount time and never
+// show up in /proc/mounts. Testing the live options told us the drive was
+// "missing nofail" when the fstab line said nofail plain as day.
+func (p *Probe) FstabHasOption(uuid, opt string) bool {
+	line, ok := p.FstabEntry(uuid)
+	return ok && strings.Contains(line, opt)
 }
 
 // FolderBytes totals the folders that would actually be adopted.
