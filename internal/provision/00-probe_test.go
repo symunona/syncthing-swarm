@@ -117,9 +117,27 @@ func TestProbeRue(t *testing.T) {
 	if p.Hash == nil || p.Hash.BytesPerSec == 0 {
 		t.Fatal("no hash benchmark in fixture")
 	}
-	secs, ok := p.ScanETA(cap.UsedBytes)
-	if !ok || secs < 3600 {
-		t.Errorf("ScanETA = %ds (ok=%v); 305GiB at ~12MiB/s should be hours", secs, ok)
+
+	// The ETA must be sized off the FOLDERS, not the filesystem. Getting this
+	// wrong is not cosmetic: rue's drive holds 305 GiB but only ~20 GiB of
+	// syncthing folders, so df-based sizing claimed "7h15m" where the truth is
+	// ~23 min. An ETA that overstates by 15x is one nobody reads.
+	fb := p.FolderBytes()
+	if fb == 0 {
+		t.Fatal("FolderBytes = 0: per-folder du missing from the probe")
+	}
+	if fb >= cap.UsedBytes {
+		t.Errorf("FolderBytes (%s) >= filesystem used (%s): the folders are a SUBSET of the disk",
+			HumanBytes(fb), HumanBytes(cap.UsedBytes))
+	}
+	fsSecs, _ := p.ScanETA(cap.UsedBytes)
+	folderSecs, ok := p.ScanETA(fb)
+	if !ok || folderSecs <= 0 {
+		t.Fatalf("ScanETA over folders = %ds (ok=%v)", folderSecs, ok)
+	}
+	if folderSecs >= fsSecs {
+		t.Errorf("folder ETA (%s) is not cheaper than filesystem ETA (%s) — sizing is still off df",
+			HumanDuration(folderSecs), HumanDuration(fsSecs))
 	}
 }
 

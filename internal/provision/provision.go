@@ -215,10 +215,11 @@ type FSCapacity struct {
 // index database — exactly what dies with the SD card. The ID is recovered from
 // the swarm instead, joined to this by Name (see 05-adopt.go).
 type StFolder struct {
-	Path string `json:"path"` // /media/hdd/syncthing/dropx
-	Root string `json:"root"` // /media/hdd
-	ID   string `json:"id"`   // ~always "" — see above
-	Name string `json:"name"` // dropx — the join key against folder labels
+	Path  string `json:"path"`  // /mnt/hdd/syncthing/dropx
+	Root  string `json:"root"`  // /mnt/hdd
+	ID    string `json:"id"`    // ~always "" — see above
+	Name  string `json:"name"`  // dropx — the join key against folder labels
+	Bytes int64  `json:"bytes"` // du of the folder; 0 if the tree was too big to walk
 }
 
 type HashBench struct {
@@ -325,15 +326,31 @@ func (p *Probe) InFstab(uuid string) bool {
 	return false
 }
 
-// ScanETA estimates the one-time initial hash of everything on the drive. This
-// is the number that tells you whether adoption is a coffee break or an
-// overnight job: the scan is hash-bound on a small ARM core, and it transfers
-// nothing over the network.
-func (p *Probe) ScanETA(usedBytes int64) (secs int64, ok bool) {
-	if p.Hash == nil || p.Hash.BytesPerSec <= 0 || usedBytes <= 0 {
+// FolderBytes totals the folders that would actually be adopted.
+//
+// NOT the filesystem's used bytes. Syncthing hashes the folders you configure,
+// not the disk they sit on — and on the first real box those differed by 15x
+// (a 305 GiB drive holding 20 GiB of syncthing folders). Sizing the ETA off df
+// produced "7h15m" where the truth was "13 min", which is how you train someone
+// to ignore the number.
+func (p *Probe) FolderBytes() int64 {
+	var n int64
+	for _, f := range p.StFolders {
+		n += f.Bytes
+	}
+	return n
+}
+
+// ScanETA estimates the one-time initial hash of the given bytes. The scan is
+// hash-bound on a small ARM core, and it transfers nothing over the network:
+// once hashed, blocks that match what peers already hold are simply marked in
+// sync. Returns ok=false when the hash benchmark did not run, or when du was
+// skipped (a tree too large to walk), rather than inventing a number.
+func (p *Probe) ScanETA(bytes int64) (secs int64, ok bool) {
+	if p.Hash == nil || p.Hash.BytesPerSec <= 0 || bytes <= 0 {
 		return 0, false
 	}
-	return usedBytes / p.Hash.BytesPerSec, true
+	return bytes / p.Hash.BytesPerSec, true
 }
 
 // --- formatting -------------------------------------------------------------

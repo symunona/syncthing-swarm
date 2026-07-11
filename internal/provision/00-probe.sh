@@ -309,17 +309,34 @@ check_stfolders() {
 	roots=$(scan_roots)
 	[ -z "$roots" ] && { skip stfolders "no non-OS filesystem mounted (external drive absent or not mounted)"; return; }
 
-	local out sep="" root marker dir id
+	local out sep="" root marker dir id bytes iused
+
+	# Size the FOLDERS, not the filesystem.
+	#
+	# The scan ETA was originally derived from `df` used-bytes, to dodge an
+	# expensive du. That was wrong by 15x on the first real box: rue's drive holds
+	# 305 GiB, but only 20 GiB of it is syncthing folders — syncthing hashes what
+	# you configure, not what the disk contains. An ETA that says "7 hours" when
+	# the truth is "13 minutes" is an ETA nobody reads.
+	#
+	# du is only affordable when the tree is small, so gate it on the inode count
+	# (which df gives us for free). rue: 31k inodes, du took ~1s.
+	iused=$(df --output=iused "$(printf '%s\n' $roots | head -n1)" 2>/dev/null | tail -n1 | tr -d ' ')
+	local do_du=1
+	[ "${iused:-0}" -gt "${PROBE_DU_MAX_INODES:-400000}" ] && do_du=0
+
 	out=""
 	for root in $roots; do
 		while IFS= read -r marker; do
 			[ -z "$marker" ] && continue
 			dir=$(dirname "$marker")
 			id=""
-			# syncthing >= ~1.6 stamps the folder id in here
+			# read the id if a future syncthing ever stamps one here (today: never)
 			[ -r "$marker/syncthing-folder.txt" ] && \
 				id=$(grep -iE '^[[:space:]]*folderID:' "$marker/syncthing-folder.txt" 2>/dev/null | head -n1 | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r')
-			out="$out$sep{\"path\":$(jstr "$dir"),\"root\":$(jstr "$root"),\"id\":$(jstr "$id"),\"name\":$(jstr "$(basename "$dir")")}"
+			bytes=0
+			[ "$do_du" = 1 ] && bytes=$(du -sb "$dir" 2>/dev/null | cut -f1)
+			out="$out$sep{\"path\":$(jstr "$dir"),\"root\":$(jstr "$root"),\"id\":$(jstr "$id"),\"name\":$(jstr "$(basename "$dir")"),\"bytes\":${bytes:-0}}"
 			sep=","
 		done <<-EOF
 			$(find "$root" -mindepth 1 -maxdepth 3 -type d \

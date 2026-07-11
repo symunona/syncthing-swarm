@@ -211,14 +211,16 @@ func (r *Renderer) Summary(p *Probe) {
 		fmt.Fprintf(w, "  drive        %s (%s, %s) — %s used of %s\n",
 			d.Mountpoint, kind, d.Model, HumanBytes(cap.UsedBytes), HumanBytes(cap.SizeBytes))
 
-		// The number that decides whether adoption is a coffee break or an
-		// overnight job. Scanning is hash-bound on a small ARM core, and it
-		// transfers nothing over the network.
-		if secs, ok := p.ScanETA(cap.UsedBytes); ok {
-			fmt.Fprintf(w, "  initial scan %s at ~%s/s → est. %s\n",
-				HumanBytes(cap.UsedBytes), HumanBytes(p.Hash.BytesPerSec), HumanDuration(secs))
-			fmt.Fprintf(w, "               one-time: rebuilds the index the old boot media took with it.\n")
-			fmt.Fprintf(w, "               Transfers nothing over the network.\n")
+		// Size the ETA off the syncthing FOLDERS, not the filesystem: syncthing
+		// hashes what you configure, not what the disk happens to hold. On rue
+		// those differ by 15x (305 GiB drive, 20 GiB of folders).
+		if fb := p.FolderBytes(); fb > 0 {
+			if secs, ok := p.ScanETA(fb); ok {
+				fmt.Fprintf(w, "  initial scan %s of syncthing folders at ~%s/s → est. %s\n",
+					HumanBytes(fb), HumanBytes(p.Hash.BytesPerSec), HumanDuration(secs))
+				fmt.Fprintf(w, "               one-time, and only for the folders you adopt.\n")
+				fmt.Fprintf(w, "               Transfers nothing over the network — matching blocks just verify.\n")
+			}
 		}
 
 		// inotify: syncthing needs roughly one watch per directory. Over the
@@ -234,10 +236,18 @@ func (r *Renderer) Summary(p *Probe) {
 	if len(p.StFolders) > 0 {
 		fmt.Fprintf(w, "  folders      %d existing syncthing folder(s) on the drive:\n", len(p.StFolders))
 		for _, f := range p.StFolders {
-			fmt.Fprintf(w, "               %-20s %s\n", f.Name, f.Path)
+			size := "—"
+			if f.Bytes > 0 {
+				size = HumanBytes(f.Bytes)
+			}
+			eta := ""
+			if secs, ok := p.ScanETA(f.Bytes); ok {
+				eta = "  (~" + HumanDuration(secs) + " to hash)"
+			}
+			fmt.Fprintf(w, "               %-18s %8s  %s%s\n", f.Name, size, f.Path, eta)
 		}
-		fmt.Fprintln(w, "               These carry no folder ID (syncthing keeps it in its index, not on")
-		fmt.Fprintln(w, "               disk). They will be matched against the swarm's folders by name.")
+		fmt.Fprintln(w, "               These carry no folder ID — syncthing keeps it in its index, not on")
+		fmt.Fprintln(w, "               disk. They get matched to the swarm's folders by name + content.")
 	}
 
 	// Security findings, smallest useful set.
