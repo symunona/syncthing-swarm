@@ -137,6 +137,33 @@ func (c *Client) PutDevice(ctx context.Context, d Device) error {
 	return err
 }
 
+// BrowseTop lists a folder's top-level entry names from the GLOBAL index — so
+// any node that knows the folder can answer, even one that holds none of the
+// files locally.
+//
+// This is the fingerprint used to match a directory found on a new node's disk
+// against the folder it actually is. Names alone are not enough: on a real drive
+// the folder labelled "Music" sits in a directory called "music", and "Music
+// Resources" in "music_resources". Worse, a coincidental name match would cause
+// an adoption under the WRONG folder ID — the one genuinely destructive mistake
+// available here.
+func (c *Client) BrowseTop(ctx context.Context, folderID string) ([]string, error) {
+	var entries []struct {
+		Name string `json:"name"`
+	}
+	q := url.Values{"folder": {folderID}, "levels": {"0"}}
+	if err := c.get(ctx, "/rest/db/browse", q, &entries); err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.Name != "" {
+			names = append(names, e.Name)
+		}
+	}
+	return names, nil
+}
+
 // --- response shapes (only the fields we use) ---
 
 type Version struct {

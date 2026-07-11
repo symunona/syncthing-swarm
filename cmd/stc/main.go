@@ -31,6 +31,8 @@ func main() {
 		cmdUnshare(os.Args[2:])
 	case "bootstrap":
 		cmdBootstrap(os.Args[2:])
+	case "adopt":
+		cmdAdopt(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
