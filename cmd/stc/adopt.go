@@ -29,6 +29,9 @@ func cmdAdopt(args []string) {
 	ftype := fs.String("type", "", "folder type on this node: sendreceive | receiveonly (default: ask per folder)")
 	rescan := fs.Int("rescan", 604800, "rescanIntervalS for adopted folders (0 disables periodic scanning)")
 	yes := fs.Bool("yes", false, "adopt every exact match without asking")
+	idsFrom := fs.String("ids-from", "", "a salvaged config.xml: recovers the folder IDs of ORPHANS "+
+		"(folders that exist on this disk and nowhere else in the swarm), so a peer that "+
+		"returns later re-links instead of silently duplicating them")
 	fs.Parse(args)
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "adopt needs a node name from swarm.yaml, e.g. `stc adopt rue`")
@@ -82,8 +85,17 @@ func cmdAdopt(args []string) {
 	fmt.Println("  not is the one genuinely destructive case, so it is never a default.")
 	fmt.Println()
 
+	// Orphans: folders on this disk that exist NOWHERE ELSE in the swarm, so the
+	// swarm cannot supply their ID. A salvaged config.xml can.
+	var recovered map[string]provision.RecoveredFolder
+	if *idsFrom != "" {
+		recovered, err = provision.RecoveredIDs(*idsFrom)
+		die(err)
+		fmt.Printf("  recovered %d folder IDs from %s\n\n", len(recovered), *idsFrom)
+	}
+
 	for _, c := range cands {
-		printCandidate(c)
+		printCandidate(c, recovered)
 	}
 
 	if *dryRun {
@@ -95,7 +107,16 @@ func cmdAdopt(args []string) {
 	adopted, skipped := 0, 0
 	for _, c := range cands {
 		if c.Verdict == provision.VerdictOrphan {
-			skipped++
+			rec, ok := recovered[strings.ToLower(c.Dir.Name)]
+			if !ok {
+				skipped++
+				continue
+			}
+			if !adoptOrphan(ctx, in, cfg, *node, newID, c, rec, *rescan, *yes) {
+				skipped++
+				continue
+			}
+			adopted++
 			continue
 		}
 		fmt.Printf("\n  %s → folder %q (%s)\n", c.Dir.Name, c.Match.Label, c.Match.ID)
@@ -151,8 +172,46 @@ func cmdAdopt(args []string) {
 	}
 }
 
-func printCandidate(c provision.Candidate) {
+// adoptOrphan configures a folder that lives on this disk and nowhere else in the
+// swarm, with NO peers, reusing the ID salvaged from the node's old config.
+//
+// sendreceive, not receiveonly: this node holds the only live copy, so it has to
+// be able to SEND. A receive-only folder would never propagate its contents to a
+// peer that comes back.
+func adoptOrphan(ctx context.Context, in *bufio.Reader, cfg *config.Config, node config.Node,
+	newID string, c provision.Candidate, rec provision.RecoveredFolder, rescan int, yes bool) bool {
+
+	fmt.Printf("\n  %s → orphan folder %q (%s), recovered from the old config\n",
+		c.Dir.Name, rec.Label, rec.ID)
+	fmt.Println("     No other node in the swarm has this folder, so it gets NO peers.")
+	fmt.Println("     Reusing its old ID costs nothing and means a peer that comes back later")
+	fmt.Println("     re-links to it, instead of the two becoming permanently separate folders.")
+
+	if !yes {
+		fmt.Print("     add it (unshared)? [y/N]: ")
+		line, _ := in.ReadString('\n')
+		if l := strings.ToLower(strings.TrimSpace(line)); l != "y" && l != "yes" {
+			fmt.Println("     skipped.")
+			return false
+		}
+	}
+	if err := provision.AdoptOrphan(ctx, node, newID, c.Dir, rec, rescan); err != nil {
+		fmt.Printf("     ✗ %v\n", err)
+		return false
+	}
+	fmt.Printf("     ✓ added as sendreceive, no peers (%s, rescan %s)\n", rec.ID, dur(rescan))
+	return true
+}
+
+func printCandidate(c provision.Candidate, recovered map[string]provision.RecoveredFolder) {
 	mark, note := "?", ""
+	if c.Verdict == provision.VerdictOrphan {
+		if rec, ok := recovered[strings.ToLower(c.Dir.Name)]; ok {
+			fmt.Printf("  + %-18s %s  (orphan — nobody else has it; old ID %s recovered, will be added UNSHARED)\n",
+				c.Dir.Name, rec.Label, rec.ID)
+			return
+		}
+	}
 	switch c.Verdict {
 	case provision.VerdictExact:
 		mark = "✓"

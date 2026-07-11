@@ -2,7 +2,10 @@ package provision
 
 import (
 	"context"
+	"encoding/xml"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -246,6 +249,84 @@ func jaccard(a, b []string) float64 {
 		return 0
 	}
 	return float64(inter) / float64(union)
+}
+
+// RecoveredFolder is a folder id read out of a node's OLD config.xml — salvaged
+// from boot media that failed.
+type RecoveredFolder struct {
+	ID    string
+	Label string
+	Dir   string // basename of the old path: the join key against what is on disk
+}
+
+// RecoveredIDs parses folder ids out of a salvaged syncthing config.xml.
+//
+// This is the only way to recover the id of a folder that exists NOWHERE ELSE in
+// the swarm. Without it such a folder can only be re-created with a fresh id —
+// and if the peer that shares it ever comes back, the two copies are then
+// permanently DIFFERENT folders: silent duplication instead of a re-link.
+func RecoveredIDs(path string) (map[string]RecoveredFolder, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var doc struct {
+		Folders []struct {
+			ID    string `xml:"id,attr"`
+			Label string `xml:"label,attr"`
+			Path  string `xml:"path,attr"`
+		} `xml:"folder"`
+	}
+	if err := xml.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	out := map[string]RecoveredFolder{}
+	for _, f := range doc.Folders {
+		// syncthing's config carries a <defaults> template with an empty folder
+		if f.ID == "" || f.Path == "" {
+			continue
+		}
+		dir := filepath.Base(strings.TrimRight(f.Path, "/"))
+		label := f.Label
+		if label == "" {
+			label = f.ID
+		}
+		out[strings.ToLower(dir)] = RecoveredFolder{ID: f.ID, Label: label, Dir: dir}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s has no folders", path)
+	}
+	return out, nil
+}
+
+// AdoptOrphan configures a folder that exists on this node's disk and NOWHERE
+// ELSE in the swarm, with no peers.
+//
+// It uses the id salvaged from the node's old config, not a fresh one. That costs
+// nothing and preserves the only thing that matters here: if the peer that used
+// to share this folder ever comes back, it still holds the folder under the same
+// id and the two re-link. A fresh id would make them permanently distinct folders
+// — the same files, duplicated, never converging.
+//
+// Type is sendreceive, deliberately: this node holds the ONLY live copy, so it
+// must be able to SEND. A receive-only folder would never propagate its contents
+// to a returning peer.
+func AdoptOrphan(ctx context.Context, newNode config.Node, newID string,
+	dir StFolder, rec RecoveredFolder, rescanSecs int) error {
+
+	f := stclient.Folder{
+		"id":               rec.ID,
+		"label":            rec.Label,
+		"path":             dir.Path,
+		"type":             "sendreceive",
+		"devices":          []any{map[string]any{"deviceID": newID}},
+		"fsWatcherEnabled": true,
+		"rescanIntervalS":  rescanSecs,
+	}
+	if err := stclient.New(newNode.URL, newNode.APIKey).PutFolder(ctx, f); err != nil {
+		return fmt.Errorf("create %s on %s: %w", rec.Label, newNode.Name, err)
+	}
+	return nil
 }
 
 // Adopt creates the folder on the new node with its EXISTING id at its EXISTING
