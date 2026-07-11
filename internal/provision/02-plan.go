@@ -56,6 +56,38 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 		done = append(done, fmt.Sprintf("inotify watches already %d", p.Inotify.MaxUserWatches))
 	}
 
+	// --- an attached but unmounted drive -------------------------------------
+	// A USB disk on a headless box does not auto-mount — no desktop session, no
+	// udisks. So "plug the drive in, run the wizard" lands here, and until it is
+	// mounted the wizard is blind to it: no fstab step, no spindown, no folder
+	// scan, and syncthing folders would default onto the SD card.
+	for _, u := range p.UnmountedDrives() {
+		mp := SuggestMountpoint(u)
+		kind := "flash"
+		if u.Rotational {
+			kind = "spinning disk"
+		}
+		steps = append(steps, Step{
+			ID: "mount",
+			Title: fmt.Sprintf("mount %s (%s %s) at %s",
+				u.Device, HumanBytes(u.SizeBytes), kind, mp),
+			Why: "the drive is plugged in but NOT mounted — a USB disk on a headless box\n" +
+				"    never auto-mounts. Until it is, syncthing folders would land on the SD\n" +
+				"    card. Mounted by UUID with nofail + a 10s device timeout, so a missing\n" +
+				"    drive can never stall boot",
+			Cmds: []string{
+				"mkdir -p " + mp,
+				"cp /etc/fstab /etc/fstab.stc-backup",
+				fmt.Sprintf("grep -q '%s' /etc/fstab || "+
+					"printf 'UUID=%s\\t%s\\t%s\\tdefaults,nofail,noatime,x-systemd.device-timeout=10s\\t0\\t0\\n' >> /etc/fstab",
+					u.UUID, u.UUID, mp, u.FSType),
+				"systemctl daemon-reload",
+				"mount " + mp,
+				"findmnt " + mp,
+			},
+		})
+	}
+
 	// --- the drive -----------------------------------------------------------
 	for _, d := range drives {
 		if !p.InFstab(d.UUID) {
@@ -156,7 +188,16 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 				Cmds: []string{
 					aptGet("install -y hd-idle"),
 					fmt.Sprintf("printf 'START_HD_IDLE=true\\nHD_IDLE_OPTS=\"-i 0 -a %s -i 600\"\\n' > /etc/default/hd-idle", disk),
-					"systemctl enable --now hd-idle",
+					// The package's postinst starts hd-idle with its DEFAULT config —
+					// before ours exists — so it fails, retries, and burns systemd's
+					// start limit. Our `enable --now` then gets refused with
+					// "start-limit-hit", and the real error is buried. Clear the
+					// counter before starting the service with the config we wrote.
+					"systemctl reset-failed hd-idle 2>/dev/null || true",
+					"systemctl enable hd-idle",
+					"systemctl restart hd-idle",
+					// installed is not running
+					"systemctl is-active --quiet hd-idle",
 				},
 			}
 			// A spindown policy on a board that cannot feed the disk is not a
@@ -183,7 +224,12 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 		}
 	}
 	if len(drives) == 0 {
-		done = append(done, "no data drive — skipping fstab and spindown steps")
+		if len(p.UnmountedDrives()) > 0 {
+			done = append(done, "drive is attached but unmounted — the mount step below fixes that; "+
+				"spindown gets planned once it is mounted (re-run to pick it up)")
+		} else {
+			done = append(done, "no data drive — skipping fstab and spindown steps")
+		}
 	}
 
 	// --- security ------------------------------------------------------------
@@ -237,6 +283,11 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 		"systemctl restart fail2ban",
 		// Do not declare victory on a service that is not running.
 		"systemctl is-active --quiet fail2ban",
+		// ...but do not race it either. fail2ban-server takes a second or two to
+		// create its socket, and asking it for jail status the instant after
+		// `restart` returns fails with "Is fail2ban running?" on a daemon that is
+		// in fact starting perfectly well. Wait for readiness instead of guessing.
+		"for i in $(seq 1 20); do fail2ban-client status sshd >/dev/null 2>&1 && break; sleep 1; done",
 		"fail2ban-client status sshd",
 	}
 	switch {

@@ -79,7 +79,18 @@ func summarize(check string, p *Probe) string {
 	case "disks":
 		ds := p.Drives()
 		if len(ds) == 0 {
-			return "no external drive mounted"
+			// "no external drive" is a lie when one is plugged in and simply not
+			// mounted — which is the normal state of a USB disk on a headless box.
+			if un := p.UnmountedDrives(); len(un) > 0 {
+				u := un[0]
+				kind := "flash"
+				if u.Rotational {
+					kind = "rotational(HDD)"
+				}
+				return fmt.Sprintf("%s %s %s %s — ATTACHED BUT NOT MOUNTED",
+					u.Device, HumanBytes(u.SizeBytes), kind, u.FSType)
+			}
+			return "no external drive attached"
 		}
 		var parts []string
 		for _, d := range ds {
@@ -206,8 +217,18 @@ func (r *Renderer) Summary(p *Probe) {
 
 	drives := p.Drives()
 	if len(drives) == 0 {
-		fmt.Fprintln(w, "  ⚠ no external drive mounted — syncthing folders would land on the boot media.")
-		fmt.Fprintln(w, "    On a Pi that means the SD card: slow, and it wears out. Mount the drive first.")
+		if un := p.UnmountedDrives(); len(un) > 0 {
+			u := un[0]
+			fmt.Fprintf(w, "  drive        %s (%s, %s) is ATTACHED but NOT MOUNTED\n",
+				u.Device, HumanBytes(u.SizeBytes), u.FSType)
+			fmt.Fprintf(w, "               A USB disk on a headless box never auto-mounts. The plan below\n")
+			fmt.Fprintf(w, "               mounts it at %s (by UUID, nofail) so folders do not land on the SD card.\n",
+				SuggestMountpoint(u))
+			fmt.Fprintln(w)
+			return
+		}
+		fmt.Fprintln(w, "  ⚠ no external drive attached — syncthing folders would land on the boot media.")
+		fmt.Fprintln(w, "    On a Pi that means the SD card: slow, and it wears out. Attach the drive first.")
 		return
 	}
 

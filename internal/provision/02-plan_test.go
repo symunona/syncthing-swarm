@@ -288,6 +288,103 @@ func TestPlanAptWaitsForTheDpkgLock(t *testing.T) {
 	}
 }
 
+// Every service step must (a) clear a poisoned systemd start limit before
+// starting, and (b) verify the service actually RUNS afterwards.
+//
+// Both come from real failures. hd-idle's package postinst starts the service
+// with its DEFAULT config — before ours exists — so it fails, retries, and burns
+// systemd's start limit; our `enable --now` was then refused with
+// "start-limit-hit" and the real error was buried. And fail2ban installed,
+// enabled, and crashed while the wizard reported success.
+func TestPlanServiceStepsResetAndVerify(t *testing.T) {
+	p := parseFixture(t, "rue-pi1b.ndjson")
+	p.Power = Power{Throttled: "0x0", MaxUsbCurrent: "max_usb_current=1"}
+	steps, _ := Plan(p, "symunona")
+
+	for _, id := range []string{"hd-idle", "fail2ban"} {
+		s := stepByID(steps, id)
+		if s == nil {
+			t.Fatalf("no %q step", id)
+		}
+		joined := strings.Join(s.Cmds, "\n")
+		if !strings.Contains(joined, "is-active --quiet "+id) {
+			t.Errorf("%s never verifies the service is actually running: installed is not running", id)
+		}
+	}
+
+	hd := stepByID(steps, "hd-idle")
+	if !strings.Contains(strings.Join(hd.Cmds, "\n"), "reset-failed hd-idle") {
+		t.Error("hd-idle does not clear the start limit its own postinst poisoned; " +
+			"systemd will refuse to start it with 'start-limit-hit'")
+	}
+}
+
+// A USB disk on a headless box does not auto-mount — there is no desktop session
+// running udisks. So the obvious flow ("plug the drive into the Pi, run the
+// wizard") produces a disk that is plugged in, spinning, and invisible: the
+// wizard said "no external drive" while the disk sat right there, and syncthing
+// folders would have landed on the SD card.
+func TestPlanMountsAnAttachedButUnmountedDrive(t *testing.T) {
+	p := parseFixture(t, "rue-pi1b.ndjson")
+	// same box, but the disk is attached and NOT mounted (papi's real state)
+	for i := range p.Disks {
+		for j := range p.Disks[i].Children {
+			if p.Disks[i].Children[j].Mountpoint == "/mnt/hdd" {
+				p.Disks[i].Children[j].Mountpoint = ""
+			}
+		}
+	}
+	p.Power = Power{Throttled: "0x0", MaxUsbCurrent: "max_usb_current=1"}
+
+	if len(p.Drives()) != 0 {
+		t.Fatal("fixture should have no MOUNTED data drive")
+	}
+	un := p.UnmountedDrives()
+	if len(un) != 1 {
+		t.Fatalf("UnmountedDrives() = %d, want the attached disk", len(un))
+	}
+	if un[0].UUID == "" {
+		t.Error("unmounted drive has no UUID — the fstab entry is written from it")
+	}
+
+	steps, _ := Plan(p, "symunona")
+	m := stepByID(steps, "mount")
+	if m == nil {
+		t.Fatal("a plugged-in, unmounted disk was not scheduled to be mounted; " +
+			"the wizard would report 'no drive' and put folders on the SD card")
+	}
+	joined := strings.Join(m.Cmds, " ")
+	for _, want := range []string{un[0].UUID, "nofail", "x-systemd.device-timeout=10s", "mkdir -p"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("mount step missing %q: %s", want, joined)
+		}
+	}
+
+	// The boot media must never be offered as a mount candidate, even though the
+	// SD card reports hotplug=true on a Pi.
+	for _, u := range un {
+		if strings.Contains(u.Device, "mmcblk") {
+			t.Errorf("offered to mount the SD card: %s", u.Device)
+		}
+	}
+}
+
+func TestSuggestMountpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		d    Drive
+		want string
+	}{
+		{"labelled", Drive{Label: "Backup", Rotational: true}, "/mnt/backup"},
+		{"spinning, no label", Drive{Rotational: true}, "/mnt/hdd"},
+		{"flash, no label", Drive{Rotational: false}, "/mnt/ssd"},
+	} {
+		if got := SuggestMountpoint(tc.d); got != tc.want {
+			t.Errorf("%s: SuggestMountpoint = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 // The rule that killed rue.
 //
 // rue was a Pi 1 B+ with a bus-powered 2.5" HDD. The board caps its ENTIRE USB

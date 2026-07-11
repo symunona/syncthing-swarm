@@ -272,9 +272,10 @@ type HashBench struct {
 // policy (hd-idle, weekly rescan, noatime); flash gets none of it.
 type Drive struct {
 	Device     string // /dev/sda1
-	Mountpoint string // /mnt/hdd
+	Mountpoint string // /mnt/hdd — EMPTY means attached but not mounted
 	FSType     string
 	UUID       string
+	Label      string
 	Rotational bool
 	USB        bool
 	SizeBytes  int64
@@ -312,7 +313,7 @@ func (p *Probe) Drives() []Drive {
 			continue
 		}
 		for _, part := range disk.Children {
-			if part.FSType == "" || osMount(part.Mountpoint) {
+			if part.FSType == "" || part.Mountpoint == "" || osMount(part.Mountpoint) {
 				continue
 			}
 			out = append(out, Drive{
@@ -320,6 +321,7 @@ func (p *Probe) Drives() []Drive {
 				Mountpoint: part.Mountpoint,
 				FSType:     part.FSType,
 				UUID:       part.UUID,
+				Label:      part.Label,
 				Rotational: disk.Rota,
 				USB:        disk.Tran == "usb",
 				SizeBytes:  part.Size,
@@ -328,6 +330,54 @@ func (p *Probe) Drives() []Drive {
 		}
 	}
 	return out
+}
+
+// UnmountedDrives are data partitions that are PLUGGED IN but not mounted.
+//
+// A USB drive attached to a headless box does not auto-mount: there is no
+// desktop session running udisks to do it for you. So the obvious flow — plug
+// the disk into the Pi, then run the wizard — lands exactly here, and a wizard
+// that only looks at MOUNTED filesystems reports "no external drive" while the
+// disk sits right there, spinning.
+func (p *Probe) UnmountedDrives() []Drive {
+	var out []Drive
+	for _, disk := range p.Disks {
+		if disk.Type != "disk" {
+			continue
+		}
+		// Removable media only — never offer to mount an unmounted OS partition.
+		if disk.Tran != "usb" && !disk.Hotplug {
+			continue
+		}
+		for _, part := range disk.Children {
+			if part.FSType == "" || part.FSType == "swap" || part.Mountpoint != "" {
+				continue
+			}
+			out = append(out, Drive{
+				Device:     part.Path,
+				FSType:     part.FSType,
+				UUID:       part.UUID,
+				Label:      part.Label,
+				Rotational: disk.Rota,
+				USB:        disk.Tran == "usb",
+				SizeBytes:  part.Size,
+				Model:      strings.TrimSpace(disk.Model),
+			})
+		}
+	}
+	return out
+}
+
+// SuggestMountpoint guesses where a drive belongs: /mnt/<label> when the
+// filesystem carries one, else /mnt/hdd for a spinning disk, /mnt/ssd for flash.
+func SuggestMountpoint(d Drive) string {
+	if l := strings.ToLower(strings.TrimSpace(d.Label)); l != "" {
+		return "/mnt/" + l
+	}
+	if d.Rotational {
+		return "/mnt/hdd"
+	}
+	return "/mnt/ssd"
 }
 
 // WeakUSBPower reports a board whose USB bus cannot reliably feed a spinning
