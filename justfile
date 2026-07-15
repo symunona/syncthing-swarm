@@ -40,6 +40,15 @@ share folder target:
 unshare folder target:
     go run ./cmd/stc unshare {{folder}} {{target}} -config {{config}}
 
+# build everything and (re)start the local dashboard on :8888 in tmux `stdash`.
+# run this at the end of a task so :8888 always matches the code.
+deploy: build
+    -tmux kill-session -t stdash 2>/dev/null
+    -pkill -x swarmd 2>/dev/null
+    sleep 1
+    tmux new-session -d -s stdash "exec ./swarmd -config {{config}}"
+    @echo "deployed to :8888 in tmux session 'stdash' — logs: tmux attach -t stdash"
+
 # run go tests
 test:
     go test ./...
