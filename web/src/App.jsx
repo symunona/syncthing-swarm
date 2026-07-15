@@ -1,6 +1,10 @@
-import { createSignal, createResource, createEffect, For, Index, Show, onCleanup, createMemo } from "solid-js";
+import { createSignal, createResource, createEffect, For, Index, Show, onCleanup, onMount, createMemo } from "solid-js";
+import cytoscape from "cytoscape";
+import fcose from "cytoscape-fcose";
+cytoscape.use(fcose);
 
 const MATRIX_POLL = 5000;
+const TABS = ["matrix", "mesh", "share", "settings"];
 
 async function fetchMatrix() {
   const r = await fetch("/api/matrix");
@@ -77,8 +81,8 @@ export default function App() {
   const [data, { refetch }] = createResource(fetchMatrix);
   const [disk, { refetch: refetchDisk }] = createResource(fetchDisk);
   const [sel, setSel] = createSignal(null); // {folder, device?, tab?}
-  const [view, setView] = createSignal("matrix"); // matrix | settings
-  const [shareMode, setShareMode] = createSignal(false);
+  const [tab, setTab] = createSignal("matrix"); // matrix | mesh | share | settings
+  const shareMode = () => tab() === "share";
   const [busy, setBusy] = createSignal(null); // status string
   const [confirm, setConfirm] = createSignal(null); // {folder, target}
   const t = setInterval(refetch, MATRIX_POLL);
@@ -106,10 +110,11 @@ export default function App() {
   const doShare = (folder, target) => action("share", folder, target);
   const askUnshare = (folder, target) => setConfirm({ folder, target });
 
+  const onMatrix = () => tab() === "matrix";
   return (
     <div class="min-h-screen">
-      <div class="p-6" classList={{ "pb-[58vh]": !!sel() && view() === "matrix" }}>
-        <header class="mb-5 flex items-baseline gap-3">
+      <div class="p-6" classList={{ "pb-[58vh]": !!sel() && onMatrix() }}>
+        <header class="mb-4 flex items-baseline gap-3">
           <h1 class="text-xl font-semibold text-slate-100">syncthing swarm</h1>
           <Show when={data()}>
             <span class="text-xs text-slate-500">
@@ -117,23 +122,26 @@ export default function App() {
               polled {new Date(data().generatedAt).toLocaleTimeString()}
             </span>
           </Show>
-          <div class="ml-auto flex items-center gap-2">
-            <Show when={view() === "matrix"}>
-              <button onClick={() => setShareMode(!shareMode())}
-                class="rounded px-3 py-1 text-xs"
-                classList={{ "bg-sky-700 text-white": shareMode(), "bg-slate-700 hover:bg-slate-600": !shareMode() }}
-                title={"toggle share mode — check a box to share " + (data()?.source || "local") + "'s folder to a device"}>
-                {shareMode() ? "☑ share mode" : "share mode"}
-              </button>
-            </Show>
-            <button onClick={() => refetch()} class="rounded bg-slate-700 px-3 py-1 text-xs hover:bg-slate-600">refresh</button>
-            <button onClick={() => setView(view() === "settings" ? "matrix" : "settings")} title="settings"
-              class="rounded px-2 py-1 text-base leading-none hover:bg-slate-700"
-              classList={{ "bg-slate-700": view() === "settings" }}>⚙</button>
-          </div>
+          <button onClick={() => refetch()} class="ml-auto rounded bg-slate-700 px-3 py-1 text-xs hover:bg-slate-600">refresh</button>
         </header>
 
-        <Show when={shareMode() && view() === "matrix"}>
+        {/* menu bar */}
+        <nav class="mb-4 flex gap-1 border-b border-slate-800">
+          <For each={TABS}>
+            {(name) => (
+              <button onClick={() => { setTab(name); if (name !== "matrix") setSel(null); }}
+                class="-mb-px border-b-2 px-4 py-2 text-sm capitalize transition-colors"
+                classList={{
+                  "border-sky-400 text-sky-300 font-medium": tab() === name,
+                  "border-transparent text-slate-400 hover:text-slate-200": tab() !== name,
+                }}>
+                {name}
+              </button>
+            )}
+          </For>
+        </nav>
+
+        <Show when={shareMode()}>
           <div class="mb-3 rounded bg-sky-950/40 px-3 py-2 text-xs text-sky-200">
             Share mode: check a box to share <b>{data()?.source}</b>'s folder to that device (one click);
             uncheck to stop sharing (asks first, keeps files).
@@ -149,25 +157,34 @@ export default function App() {
         <Show when={data.error}>
           <div class="rounded bg-red-900/60 p-3 text-red-200">cannot reach swarmd: {String(data.error)}</div>
         </Show>
-        <Show when={data()} fallback={<div class="text-slate-500">loading…</div>}>
-          <Show when={view() === "settings"} fallback={
-            <Matrix data={data()} sel={sel()} shareMode={shareMode()} disk={disk()}
-              onFolder={(f) => setSel({ folder: f, tab: "files" })}
-              // an errored cell opens straight to the Errors tab — that is what you
-              // clicked it to find out about
-              onCell={(f, d) => {
-                const cell = (data()?.cells?.[f.id] || {})[d.name];
-                const bad = cell && (cell.state === "error" || cell.errors?.length);
-                setSel({ folder: f, device: d.name, tab: bad ? "errors" : "transfers" });
-              }}
-              onShare={doShare} onUnshare={askUnshare} />
-          }>
-            <Settings data={data()} disk={disk()} />
+
+        {/* mesh renders even before the matrix poll returns */}
+        <Show when={tab() === "mesh"}>
+          <Mesh data={data()} />
+        </Show>
+
+        <Show when={tab() !== "mesh"}>
+          <Show when={data()} fallback={<div class="text-slate-500">loading…</div>}>
+            <Show when={tab() === "settings"}>
+              <Settings data={data()} disk={disk()} />
+            </Show>
+            <Show when={onMatrix() || shareMode()}>
+              <Matrix data={data()} sel={sel()} shareMode={shareMode()} disk={disk()}
+                onFolder={(f) => onMatrix() && setSel({ folder: f, tab: "files" })}
+                // an errored cell opens straight to the Errors tab — that is what you
+                // clicked it to find out about
+                onCell={(f, d) => {
+                  const cell = (data()?.cells?.[f.id] || {})[d.name];
+                  const bad = cell && (cell.state === "error" || cell.errors?.length);
+                  setSel({ folder: f, device: d.name, tab: bad ? "errors" : "transfers" });
+                }}
+                onShare={doShare} onUnshare={askUnshare} />
+            </Show>
           </Show>
         </Show>
       </div>
 
-      <Show when={sel() && view() === "matrix" && !shareMode()}>
+      <Show when={sel() && onMatrix()}>
         <Dock sel={sel()} data={data()} onClose={() => setSel(null)} />
       </Show>
 
@@ -182,6 +199,202 @@ export default function App() {
                 class="rounded bg-red-700 px-3 py-1 text-sm text-white hover:bg-red-600">unshare</button>
             </div>
           </div>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+// basename of a syncthing item path (forward slashes even on windows nodes)
+const baseName = (p) => (p ? p.split("/").pop() : "");
+
+// Mesh: the swarm as a live graph. Nodes = devices (managed vs peer, online/
+// error), edges = connections from /api/mesh. A Server-Sent-Events stream from
+// /api/events drives the live layer: a node pulses while it's scanning/syncing,
+// its label shows folder › file, incident edges light up, and errors flash red —
+// each held for 10s after the last event. Clicking a node or edge opens a popup
+// of the files recently seen moving through that link.
+//
+// Attribution note: syncthing events are per-node+folder+file, not per-edge, so
+// activity is shown on the busy NODE and pulsed across its incident edges rather
+// than pinned to one exact peer — the honest resolution the event data supports.
+function Mesh(props) {
+  let container;
+  let cy, es;
+  const [popup, setPopup] = createSignal(null); // {title, files:[{folder,item,at,err}]}
+  const [toast, setToast] = createSignal(null);  // {msg, err}
+  const [ready, setReady] = createSignal(false);
+  const [err, setErr] = createSignal(null);
+
+  const activity = new Map();   // nodeId -> recent [{folder,item,at,err}]
+  const nameToId = new Map();   // managed node name -> device id
+  const idToName = new Map();   // device id -> display name
+  const timers = new Map();     // key -> timeout id (debounced clears)
+
+  const folderLabel = (id) => {
+    const f = props.data?.folders?.find((f) => f.id === id);
+    return (f && f.label) || id || "";
+  };
+  const schedule = (key, ms, fn) => {
+    clearTimeout(timers.get(key));
+    timers.set(key, setTimeout(fn, ms));
+  };
+  const flashToast = (msg, isErr) => {
+    setToast({ msg, err: isErr });
+    schedule("toast", isErr ? 6000 : 3500, () => setToast(null));
+  };
+
+  const recentFor = (ids) => {
+    const rows = [];
+    for (const id of ids) for (const r of activity.get(id) || []) rows.push({ ...r, node: idToName.get(id) });
+    return rows.sort((a, b) => b.at - a.at).slice(0, 30);
+  };
+
+  function handleEvent(ev) {
+    const id = nameToId.get(ev.node);
+    if (!id || !cy) return;
+    const node = cy.getElementById(id);
+    if (!node || node.empty()) return;
+
+    const isFile = ev.type === "ItemStarted" || ev.type === "ItemFinished";
+    const isErr = !!ev.error || (ev.type === "FolderErrors");
+    const isActive = isFile ||
+      (ev.type === "StateChanged" && ["scanning", "syncing", "sync-preparing", "scan-waiting"].includes(ev.state));
+
+    if (isFile && ev.item) {
+      const list = activity.get(id) || [];
+      list.unshift({ folder: folderLabel(ev.folder), item: ev.item, at: Date.now(), err: ev.error });
+      activity.set(id, list.slice(0, 25));
+    }
+    if (isErr) {
+      node.addClass("errored");
+      flashToast(`⚠ ${ev.node}: ${baseName(ev.item) || folderLabel(ev.folder)} — ${ev.error || "folder error"}`, true);
+      schedule(id + ":err", 12000, () => node.removeClass("errored"));
+    }
+    if (isActive) {
+      const label = folderLabel(ev.folder) + (ev.item ? " › " + baseName(ev.item) : "");
+      node.data("disp", idToName.get(id) + "\n" + label).addClass("active");
+      node.connectedEdges().addClass("active");
+      schedule(id, 10000, () => {
+        node.removeClass("active").data("disp", idToName.get(id));
+        node.connectedEdges().removeClass("active");
+      });
+    }
+    if (ev.type === "ItemFinished" && !ev.error) flashToast(`${ev.node} ✓ ${baseName(ev.item)}`, false);
+  }
+
+  onMount(async () => {
+    let g;
+    try {
+      g = await fetch("/api/mesh").then((r) => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); });
+    } catch (e) { setErr(String(e.message || e)); return; }
+
+    const els = [];
+    for (const n of g.nodes) {
+      idToName.set(n.id, n.name);
+      if (n.managed) nameToId.set(n.name, n.id);
+      els.push({ data: { id: n.id, name: n.name, disp: n.name, managed: !!n.managed, online: !!n.online, error: !!n.error } });
+    }
+    for (const e of g.edges) {
+      els.push({ data: { id: e.a + "~" + e.b, source: e.a, target: e.b, connected: !!e.connected, type: e.type || "" } });
+    }
+
+    cy = cytoscape({
+      container,
+      elements: els,
+      wheelSensitivity: 0.2,
+      style: [
+        { selector: "node", style: {
+            "label": "data(disp)", "color": "#cbd5e1", "font-size": 11, "text-wrap": "wrap", "text-max-width": 140,
+            "text-valign": "bottom", "text-margin-y": 4, "width": 26, "height": 26,
+            "background-color": "#475569", "border-width": 2, "border-color": "#334155" } },
+        { selector: "node[?managed]", style: { "width": 34, "height": 34, "background-color": "#0ea5e9", "border-color": "#0369a1" } },
+        { selector: "node[?online]", style: { "border-color": "#10b981" } },
+        { selector: "node[!online]", style: { "background-color": "#3f4655", "opacity": 0.7 } },
+        { selector: "node.active", style: { "border-color": "#34d399", "border-width": 4, "background-color": "#059669", "color": "#ecfdf5", "font-weight": "bold" } },
+        { selector: "node.errored", style: { "border-color": "#f87171", "border-width": 4, "background-color": "#b91c1c" } },
+        { selector: "edge", style: {
+            "width": 2, "line-color": "#334155", "curve-style": "bezier",
+            "target-arrow-shape": "none" } },
+        { selector: "edge[?connected]", style: { "line-color": "#64748b", "width": 2.5 } },
+        { selector: "edge[!connected]", style: { "line-color": "#334155", "line-style": "dashed", "opacity": 0.5 } },
+        { selector: "edge.hover", style: { "width": 6, "line-color": "#93c5fd" } },
+        { selector: "edge.active", style: { "width": 5, "line-color": "#34d399" } },
+      ],
+      layout: { name: "fcose", animate: true, animationDuration: 500, nodeSeparation: 90, idealEdgeLength: 120 },
+    });
+
+    cy.on("mouseover", "edge", (e) => { e.target.addClass("hover"); container.style.cursor = "pointer"; });
+    cy.on("mouseout", "edge", (e) => { e.target.removeClass("hover"); container.style.cursor = "default"; });
+    cy.on("mouseover", "node", () => { container.style.cursor = "pointer"; });
+    cy.on("mouseout", "node", () => { container.style.cursor = "default"; });
+    cy.on("tap", "edge", (e) => {
+      const a = e.target.data("source"), b = e.target.data("target");
+      setPopup({ title: `${idToName.get(a)} ↔ ${idToName.get(b)}`, files: recentFor([a, b]) });
+    });
+    cy.on("tap", "node", (e) => {
+      const id = e.target.id();
+      setPopup({ title: idToName.get(id) || id, files: recentFor([id]) });
+    });
+    cy.on("tap", (e) => { if (e.target === cy) setPopup(null); }); // click background = close
+
+    setReady(true);
+
+    es = new EventSource("/api/events");
+    es.onmessage = (m) => { try { handleEvent(JSON.parse(m.data)); } catch {} };
+    es.onerror = () => {}; // EventSource auto-reconnects
+  });
+
+  onCleanup(() => {
+    for (const t of timers.values()) clearTimeout(t);
+    es && es.close();
+    cy && cy.destroy();
+  });
+
+  return (
+    <div class="relative">
+      <Show when={err()}>
+        <div class="rounded bg-red-900/60 p-3 text-red-200">cannot load mesh: {err()}</div>
+      </Show>
+      <div class="mb-2 flex flex-wrap items-center gap-3 text-[11px] text-slate-400">
+        <span><span class="mr-1 inline-block h-3 w-3 rounded-full bg-sky-500 align-middle" />managed node</span>
+        <span><span class="mr-1 inline-block h-3 w-3 rounded-full bg-slate-500 align-middle" />peer device</span>
+        <span><span class="mr-1 inline-block h-2 w-2 rounded-full ring-2 ring-emerald-400 align-middle" />online</span>
+        <span><span class="mr-1 inline-block h-1 w-4 bg-emerald-400 align-middle" />live sync</span>
+        <span class="text-slate-500">click a node or edge for recently-synced files</span>
+      </div>
+      <div ref={container} class="h-[70vh] w-full rounded-lg border border-slate-800 bg-[#0b0e14]" />
+      <Show when={!ready() && !err()}>
+        <div class="absolute inset-0 flex items-center justify-center text-slate-500">building graph…</div>
+      </Show>
+
+      {/* recently-synced files popup */}
+      <Show when={popup()}>
+        <div class="absolute right-3 top-10 z-20 w-80 rounded-lg border border-slate-700 bg-[#11151f] p-3 shadow-xl">
+          <div class="mb-2 flex items-center justify-between">
+            <div class="text-sm font-medium text-slate-100">{popup().title}</div>
+            <button class="text-slate-500 hover:text-slate-200" onClick={() => setPopup(null)}>✕</button>
+          </div>
+          <Show when={popup().files.length} fallback={<div class="text-xs text-slate-500">no sync activity seen yet on this link (since you opened the mesh).</div>}>
+            <ul class="max-h-72 space-y-1 overflow-y-auto text-xs">
+              <For each={popup().files}>
+                {(r) => (
+                  <li class="flex flex-col border-b border-slate-800 pb-1">
+                    <span classList={{ "text-red-300": !!r.err, "text-slate-200": !r.err }}>{baseName(r.item)}</span>
+                    <span class="text-slate-500">{r.node} · {r.folder} · {new Date(r.at).toLocaleTimeString()}</span>
+                  </li>
+                )}
+              </For>
+            </ul>
+          </Show>
+        </div>
+      </Show>
+
+      {/* in-page sync toast */}
+      <Show when={toast()}>
+        <div class="absolute bottom-3 left-1/2 z-20 -translate-x-1/2 rounded-full px-4 py-1.5 text-xs shadow-lg"
+          classList={{ "bg-red-800 text-red-100": toast().err, "bg-slate-800 text-emerald-200": !toast().err }}>
+          {toast().msg}
         </div>
       </Show>
     </div>
@@ -546,11 +759,13 @@ const ERROR_KINDS = [
       "sitting right there, and syncthing is protecting them.",
     fix: [
       "Look at what is actually in those directories on this node (Files tab, or ssh in).",
-      "If you WANT to keep them: move them out of the folder, or add them from a node that can send.",
-      "If they are junk left over from an old copy: syncthing's \"Revert local changes\" on a " +
-        "receive-only folder deletes exactly these local-only files and makes the node match the swarm.",
+      "If they are syncthing's own .sync-conflict-* copies (it saved this node's older version " +
+        "of a file before overwriting it), they are almost always safe to delete — the swarm's " +
+        "copy is the newer one. Use \"Delete conflict copies\" below.",
+      "If you WANT to keep them: move them out of the folder first.",
     ],
-    danger: "\"Revert local changes\" DELETES the local-only files. Look at them first.",
+    danger: "Both fixes DELETE files. Preview shows you exactly which ones — read that list first.",
+    actions: ["clean-conflicts", "revert", "rescan"],
   },
   {
     match: /folder marker missing|marker/i,
@@ -563,6 +778,9 @@ const ERROR_KINDS = [
       "Check the drive is mounted on that node (the disk bar in the column header will say DRIVE MISSING).",
       "Mount it, then rescan. Nothing was propagated — syncthing stopped precisely to avoid that.",
     ],
+    // no delete actions here: the fix is to mount the drive, and deleting anything
+    // while the folder's disk is missing is the last thing you want.
+    actions: ["rescan"],
   },
   {
     match: /no space left|out of (disk )?space/i,
@@ -570,6 +788,7 @@ const ERROR_KINDS = [
     what: "Syncthing could not write because the filesystem holding this folder has no free space.",
     why: "",
     fix: ["Free space on that node, then rescan. The disk bar in the column header shows how full it is."],
+    actions: ["rescan"],
   },
   {
     match: /permission denied|operation not permitted/i,
@@ -579,6 +798,7 @@ const ERROR_KINDS = [
       "Usually a uid mismatch: the files on disk are owned by a different user than the one " +
       "syncthing runs as (common after moving a drive between machines, or restoring a backup).",
     fix: ["Check the file ownership on that node against the user in the syncthing@<user> unit."],
+    actions: ["rescan"],
   },
 ];
 
@@ -620,14 +840,15 @@ function ErrorsTab(props) {
       }>
         {/* folder-level: the folder has STOPPED */}
         <Show when={folderErr()}>
-          <Explain title="This folder has stopped" raw={folderErr()} kind={classifyError(folderErr())} />
+          <Explain title="This folder has stopped" raw={folderErr()} kind={classifyError(folderErr())}
+            node={props.node} folder={props.folder} />
         </Show>
 
         {/* per-file pull errors, grouped by kind so 200 identical errors read as one problem */}
         <Show when={(errs() || []).length}>
           <For each={groupErrors(errs())}>{(g) => (
             <Explain title={g.kind?.title || "Sync error"} kind={g.kind} count={g.items.length}
-              raw={g.items[0].error} items={g.items} node={props.node} />
+              raw={g.items[0].error} items={g.items} node={props.node} folder={props.folder} />
           )}</For>
         </Show>
 
@@ -670,6 +891,140 @@ function groupErrors(errs) {
   return groups;
 }
 
+// The fixes the UI can apply, keyed by the id an ERROR_KIND lists in `actions`.
+//
+// destructive:true means a preview is MANDATORY — the button cannot delete
+// anything until the user has been shown the exact list of files that disappear.
+// A "fix it" button that silently deletes files you have never seen is not a fix,
+// it is a trap.
+const FIXES = {
+  "clean-conflicts": {
+    label: "Delete conflict copies",
+    endpoint: "/api/fix/clean-conflicts",
+    destructive: true,
+    blurb:
+      "Deletes ONLY syncthing's own .sync-conflict-* copies that exist just on this node. " +
+      "These are the older versions it saved before overwriting a file — usually exactly what " +
+      "is blocking the directory deletions. Nothing the swarm knows about is touched.",
+  },
+  revert: {
+    label: "Revert ALL local changes",
+    endpoint: "/api/fix/revert",
+    destructive: true,
+    blurb:
+      "Deletes EVERY file that exists only on this node, so it matches the swarm exactly. " +
+      "Blunter than the targeted fix: it removes local-only files that are not conflict copies too.",
+  },
+  rescan: {
+    label: "Rescan folder",
+    endpoint: "/api/fix/rescan",
+    destructive: false,
+    blurb: "Makes syncthing look at the disk again. Changes nothing on disk.",
+  },
+};
+
+// FixButtons — preview, then apply. Destructive fixes always show the file list.
+function FixButtons(props) {
+  const [preview, setPreview] = createSignal(null); // {fix, count, files}
+  const [busy, setBusy] = createSignal("");
+  const [done, setDone] = createSignal("");
+
+  async function call(fixId, dry) {
+    const fix = FIXES[fixId];
+    setBusy(dry ? "checking…" : "applying…");
+    setDone("");
+    try {
+      const r = await fetch(fix.endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ node: props.node, folder: props.folder, preview: dry }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || r.status);
+      if (dry) {
+        setPreview({ fixId, ...j });
+      } else {
+        setPreview(null);
+        setDone(j.deleted != null ? `done — ${j.deleted} file(s) deleted, rescanning` : "done — rescanning");
+      }
+    } catch (e) {
+      setDone("error: " + String(e.message || e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <div class="mt-3 border-t border-red-900/50 pt-2">
+      <div class="mb-1.5 text-xs font-semibold text-slate-300">Fix it</div>
+      <div class="flex flex-wrap gap-2">
+        <For each={props.actions}>{(id) => {
+          const fix = FIXES[id];
+          if (!fix) return null;
+          return (
+            <button
+              disabled={!!busy()}
+              onClick={() => (fix.destructive ? call(id, true) : call(id, false))}
+              title={fix.blurb}
+              class="rounded px-2.5 py-1 text-xs disabled:opacity-50"
+              classList={{
+                "bg-red-800 text-red-100 hover:bg-red-700": fix.destructive,
+                "bg-slate-700 text-slate-200 hover:bg-slate-600": !fix.destructive,
+              }}>
+              {fix.destructive ? "⚠ " : ""}{fix.label}{fix.destructive ? "…" : ""}
+            </button>
+          );
+        }}</For>
+        <Show when={busy()}><span class="self-center text-xs text-slate-400">{busy()}</span></Show>
+        <Show when={done()}>
+          <span class="self-center text-xs"
+            classList={{ "text-red-300": done().startsWith("error"), "text-emerald-300": !done().startsWith("error") }}>
+            {done()}
+          </span>
+        </Show>
+      </div>
+
+      {/* the preview IS the safety mechanism: you cannot delete what you have not been shown */}
+      <Show when={preview()}>
+        <div class="mt-3 rounded border border-amber-700 bg-amber-950/40 p-3">
+          <div class="text-sm font-semibold text-amber-100">
+            {FIXES[preview().fixId].label} on {props.node}
+          </div>
+          <p class="mt-1 text-xs text-slate-300">{FIXES[preview().fixId].blurb}</p>
+
+          <Show when={preview().count > 0} fallback={
+            <div class="mt-2 text-xs text-slate-400">Nothing matches — there is nothing to delete.</div>
+          }>
+            <div class="mt-2 text-xs font-semibold text-amber-200">
+              This will permanently DELETE {preview().count} file{preview().count === 1 ? "" : "s"} on {props.node}:
+            </div>
+            <ul class="mt-1 max-h-56 space-y-0.5 overflow-y-auto rounded bg-black/40 p-2">
+              <For each={preview().files}>{(f) => (
+                <li class="font-mono text-[11px] text-amber-100/90">{f}</li>
+              )}</For>
+            </ul>
+            <div class="mt-1 text-[11px] text-slate-400">
+              These exist only on {props.node} — deleting them cannot affect any other node.
+              Read the list: anything here that you want, move it out of the folder first.
+            </div>
+          </Show>
+
+          <div class="mt-3 flex gap-2">
+            <button onClick={() => setPreview(null)}
+              class="rounded bg-slate-700 px-2.5 py-1 text-xs hover:bg-slate-600">Cancel</button>
+            <Show when={preview().count > 0}>
+              <button disabled={!!busy()} onClick={() => call(preview().fixId, false)}
+                class="rounded bg-red-700 px-2.5 py-1 text-xs text-red-50 hover:bg-red-600 disabled:opacity-50">
+                Delete {preview().count} file{preview().count === 1 ? "" : "s"}
+              </button>
+            </Show>
+          </div>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
 function Explain(props) {
   return (
     <div class="rounded border border-red-800 bg-red-950/30 p-3">
@@ -697,6 +1052,9 @@ function Explain(props) {
           <div class="mt-2 rounded bg-amber-950/50 px-2 py-1 text-[11px] text-amber-200 ring-1 ring-amber-800">
             ⚠ {props.kind.danger}
           </div>
+        </Show>
+        <Show when={props.kind.actions?.length && props.node && props.folder}>
+          <FixButtons node={props.node} folder={props.folder} actions={props.kind.actions} />
         </Show>
       </Show>
 

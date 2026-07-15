@@ -29,6 +29,8 @@ type Server struct {
 
 	diskMu sync.RWMutex
 	disk   map[string]diskusage.Usage
+
+	events *eventHub // on-demand relay of node event streams to browsers
 }
 
 func New(cfg *config.Config, web fs.FS) *Server {
@@ -36,12 +38,14 @@ func New(cfg *config.Config, web fs.FS) *Server {
 	for _, n := range cfg.Nodes {
 		nodes[n.Name] = n
 	}
-	return &Server{
+	s := &Server{
 		cfg:   cfg,
 		web:   web,
 		nodes: nodes,
 		proxy: &http.Client{Timeout: 12 * time.Second},
 	}
+	s.events = newEventHub(cfg)
+	return s
 }
 
 // Run polls forever and serves HTTP until ctx is cancelled.
@@ -52,6 +56,8 @@ func (s *Server) Run(ctx context.Context) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/matrix", s.handleMatrix)
+	mux.HandleFunc("/api/mesh", s.handleMesh)
+	mux.HandleFunc("/api/events", s.handleEvents)
 	mux.HandleFunc("/api/disk", s.handleDisk)
 	mux.HandleFunc("/api/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("ok"))
@@ -61,6 +67,11 @@ func (s *Server) Run(ctx context.Context) error {
 	// write actions (guarded, explicit — not via the relay)
 	mux.HandleFunc("POST /api/share", s.handleShare)
 	mux.HandleFunc("POST /api/unshare", s.handleUnshare)
+	// fixes for diagnosed errors. The destructive ones take preview=true first and
+	// the UI shows exactly which files disappear before it will call them.
+	mux.HandleFunc("POST /api/fix/rescan", s.handleRescan)
+	mux.HandleFunc("POST /api/fix/clean-conflicts", s.handleCleanConflicts)
+	mux.HandleFunc("POST /api/fix/revert", s.handleRevert)
 	if s.web != nil {
 		mux.Handle("/", http.FileServer(http.FS(s.web)))
 	}
