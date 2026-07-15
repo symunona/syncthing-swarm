@@ -137,6 +137,53 @@ func (c *Client) PutDevice(ctx context.Context, d Device) error {
 	return err
 }
 
+// DeleteDevice removes a device from this node's config. Syncthing refuses if
+// the device still shares a folder, so a non-nil error here usually means
+// "unshare its folders first" — we surface it rather than force it.
+func (c *Client) DeleteDevice(ctx context.Context, id string) error {
+	_, err := c.do(ctx, http.MethodDelete, "/rest/config/devices/"+id, nil)
+	return err
+}
+
+// Scan triggers a rescan of a folder. Non-destructive: it only makes syncthing
+// look at the disk again.
+func (c *Client) Scan(ctx context.Context, folderID string) error {
+	_, err := c.do(ctx, http.MethodPost, "/rest/db/scan?folder="+url.QueryEscape(folderID), nil)
+	return err
+}
+
+// Revert discards a receive-only folder's local changes, making it match the
+// swarm.
+//
+// DESTRUCTIVE: this DELETES every file that exists only on this node. That is
+// the whole point of it — but it is also why it must never be a one-click action
+// without showing the user exactly what disappears.
+func (c *Client) Revert(ctx context.Context, folderID string) error {
+	_, err := c.do(ctx, http.MethodPost, "/rest/db/revert?folder="+url.QueryEscape(folderID), nil)
+	return err
+}
+
+// LocalChanged lists files that exist only on this node (receive-only folders):
+// syncthing has them, the swarm does not. These are usually what blocks a
+// directory deletion — "directory not empty" means local-only files are in the
+// way.
+func (c *Client) LocalChanged(ctx context.Context, folderID string) ([]string, error) {
+	var r struct {
+		Files []struct {
+			Name string `json:"name"`
+		} `json:"files"`
+	}
+	q := url.Values{"folder": {folderID}, "perpage": {"2000"}}
+	if err := c.get(ctx, "/rest/db/localchanged", q, &r); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(r.Files))
+	for _, f := range r.Files {
+		out = append(out, f.Name)
+	}
+	return out, nil
+}
+
 // BrowseTop lists a folder's top-level entry names from the GLOBAL index — so
 // any node that knows the folder can answer, even one that holds none of the
 // files locally.
@@ -266,4 +313,45 @@ func (c *Client) SystemErrors(ctx context.Context) ([]SystemError, error) {
 	var r systemErrorsResp
 	err := c.get(ctx, "/rest/system/error", nil, &r)
 	return r.Errors, err
+}
+
+// Connection is one peer's live connection state from /rest/system/connections.
+// A device the node knows but is not talking to appears here with Connected
+// false — that is exactly the "configured but never reached" case (a node that
+// is powered on but not linked into the swarm looks like this from every peer).
+type Connection struct {
+	Connected     bool   `json:"connected"`
+	Paused        bool   `json:"paused"`
+	Address       string `json:"address"` // empty when not connected
+	Type          string `json:"type"`    // tcp-client, relay-server, quic-server, …
+	At            string `json:"at"`      // time of the connection event
+	ClientVersion string `json:"clientVersion"`
+}
+
+type connectionsResp struct {
+	Connections map[string]Connection `json:"connections"` // keyed by device ID
+}
+
+// Connections returns per-device connection state keyed by device ID. The map
+// includes an entry for every device in this node's config (offline ones too),
+// plus the node's own ID with an empty entry.
+func (c *Client) Connections(ctx context.Context) (map[string]Connection, error) {
+	var r connectionsResp
+	err := c.get(ctx, "/rest/system/connections", nil, &r)
+	return r.Connections, err
+}
+
+// DeviceStat is one device's usage stats from /rest/stats/device. LastSeen is
+// the durable "when did we last hear from this box" — it survives disconnects,
+// unlike the live connection state, so it is what tells a long-dead device from
+// one that just rebooted. The zero value "0001-01-01T00:00:00Z" means never.
+type DeviceStat struct {
+	LastSeen string `json:"lastSeen"`
+}
+
+// DeviceStats returns per-device stats keyed by device ID.
+func (c *Client) DeviceStats(ctx context.Context) (map[string]DeviceStat, error) {
+	var r map[string]DeviceStat
+	err := c.get(ctx, "/rest/stats/device", nil, &r)
+	return r, err
 }

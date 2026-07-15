@@ -33,6 +33,10 @@ func main() {
 		cmdBootstrap(os.Args[2:])
 	case "adopt":
 		cmdAdopt(os.Args[2:])
+	case "list":
+		cmdList(os.Args[2:])
+	case "device":
+		cmdDevice(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -48,6 +52,8 @@ usage:
   stc share     <folder> <target> [-path DIR] [-from NODE] [-config FILE]
   stc unshare   <folder> <target>            [-from NODE] [-config FILE]
   stc bootstrap <ssh-dest>                   [-no-bench]  [-config FILE]
+  stc list      devices                                   [-config FILE]
+  stc device    list | add <id> [name] | remove <id>      [-on N|-all] [-config FILE]
 
   <folder>    folder id or label (looked up on the source node)
   <target>    node name to share to / unshare from

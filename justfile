@@ -28,6 +28,10 @@ build: web
     go build -o stc ./cmd/stc
     @echo "built ./swarmd and ./stc"
 
+# run the stc CLI, config injected: just stc list devices
+stc *args:
+    go run ./cmd/stc {{args}} -config {{config}}
+
 # share a folder from local -> target: just share <folder> <target>
 share folder target:
     go run ./cmd/stc share {{folder}} {{target}} -config {{config}}
