@@ -171,9 +171,11 @@ func (e SSHExecutor) Apply(ctx context.Context, s Step) error {
 // password prompt in the middle of a read-only verification would be both
 // surprising and, on a fresh box, unanswerable.
 //
-// A non-zero exit means "not satisfied", not "error" — that is the whole point
-// of a predicate. Only a transport failure is an error, and the caller turns
-// that into a failed step rather than pretending the box is fine.
+// A non-zero exit in the range 0-254 means "not satisfied", not "error" —
+// that is the whole point of a predicate. Only a transport failure is an
+// error, and the caller turns that into a failed step rather than pretending
+// the box is fine. See isPredicateNo for why exit 255 is excluded from that
+// range and treated as an error instead.
 func (e SSHExecutor) Satisfied(ctx context.Context, check []string) (bool, error) {
 	if len(check) == 0 {
 		return false, fmt.Errorf("step has no Check")
@@ -181,10 +183,10 @@ func (e SSHExecutor) Satisfied(ctx context.Context, check []string) (bool, error
 	script := "set -e; " + joinAnd(check)
 	cmd := e.S.Command(ctx, false, "sh -c "+shellQuote(script))
 	if err := cmd.Run(); err != nil {
-		if isExitError(err) {
+		if isPredicateNo(err) {
 			return false, nil
 		}
-		return false, err
+		return false, fmt.Errorf("could not reach the box to run the check: %w", err)
 	}
 	return true, nil
 }
@@ -193,8 +195,30 @@ func joinAnd(cmds []string) string {
 	return strings.Join(cmds, " && ")
 }
 
-// isExitError distinguishes "the predicate said no" from "ssh could not run it".
-func isExitError(err error) bool {
+// isPredicateNo distinguishes "the predicate said no" from "ssh could not run
+// it at all" — the box being unreachable, not the check answering false.
+//
+// ssh(1), EXIT STATUS: "ssh exits with the exit status of the remote command
+// or with 255 if an error occurred." 255 is RESERVED for ssh's own failures —
+// unreachable host, a connection dropped mid-run, authentication failure —
+// and is never produced by the remote command finishing normally. So an exit
+// code of 255 must NOT be read as "not satisfied": if a connection dies
+// halfway through a run, every remaining Check would come back false, and the
+// wizard would conclude the box needs everything applied again — including
+// steps that already succeeded and are simply unreachable to re-verify right
+// now. That is worse than reporting nothing: it proposes re-running installs
+// and firewall rules against a box you cannot currently confirm the state of.
+//
+// The trade runs the other way for a REMOTE command that itself happens to
+// exit 255: it is now misreported as a transport failure rather than "no".
+// Accepted on purpose — every Check in this codebase is test/grep/systemctl
+// is-active, none of which exit 255, so the only failure mode this can ever
+// hit in practice is the one it exists to catch. Wrong in the "cannot verify"
+// direction is safe; wrong in the "not done" direction corrupts the ledger.
+func isPredicateNo(err error) bool {
 	var ee *exec.ExitError
-	return errors.As(err, &ee)
+	if !errors.As(err, &ee) {
+		return false
+	}
+	return ee.ExitCode() != 255
 }

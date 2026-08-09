@@ -13,14 +13,40 @@ type fakeExec struct {
 	applyErr   map[string]error
 	applied    []string
 	checkAfter map[string]bool // step ID -> what Satisfied returns AFTER Apply
-	checks     int
+
+	// checkErr models ssh dying instead of the predicate answering, keyed by
+	// step ID. By default it fires on the very first Satisfied call for that
+	// ID — the box was already unreachable before anything ran. Setting the
+	// same ID in checkErrAfterApply delays it until AFTER Apply has run for
+	// that ID instead, modeling a connection that dies partway through a run:
+	// the pre-Check must still succeed (so Apply gets a chance to run), and
+	// only the post-Check sees the transport failure.
+	checkErr           map[string]error
+	checkErrAfterApply map[string]bool
+
+	checks int
 }
 
 // The fake keys checks by the step ID smuggled through Check[0], so the test
 // does not have to write real shell.
 func (f *fakeExec) Satisfied(_ context.Context, check []string) (bool, error) {
 	f.checks++
-	return f.satisfied[check[0]], nil
+	id := check[0]
+	if err, ok := f.checkErr[id]; ok {
+		if !f.checkErrAfterApply[id] || f.wasApplied(id) {
+			return false, err
+		}
+	}
+	return f.satisfied[id], nil
+}
+
+func (f *fakeExec) wasApplied(id string) bool {
+	for _, a := range f.applied {
+		if a == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeExec) Apply(_ context.Context, s Step) error {
@@ -70,6 +96,50 @@ func TestRunFailsWhenPostCheckDoesNotConfirm(t *testing.T) {
 	}
 	if led[0].Err == nil {
 		t.Error("failed step carries no error to show the user")
+	}
+}
+
+// A box that cannot be reached before anything ran is a failure, not a
+// "no" — and must never get an Apply attempt against a connection that is
+// already down.
+func TestRunFailsWhenCheckCannotReachTheBox(t *testing.T) {
+	f := &fakeExec{
+		satisfied: map[string]bool{},
+		checkErr:  map[string]error{"ufw": errors.New("ssh: connection refused")},
+	}
+	led := Run(context.Background(), f, []Step{step("ufw")}, RunOpts{Confirm: alwaysYes})
+
+	if led[0].State != StateFailed {
+		t.Fatalf("state = %q, want %q", led[0].State, StateFailed)
+	}
+	if led[0].Err == nil {
+		t.Error("failed step carries no error to show the user")
+	}
+	if len(f.applied) != 0 {
+		t.Errorf("applied the step despite being unable to check it first: %v", f.applied)
+	}
+}
+
+// A connection that dies BETWEEN the pre- and post-Check must not read as
+// "the box did not change" — that would tell the wizard to propose
+// re-applying a step it can no longer even verify, on a box it can no longer
+// reach at all.
+func TestRunFailsWhenPostCheckCannotReachTheBox(t *testing.T) {
+	f := &fakeExec{
+		satisfied:          map[string]bool{},
+		checkErr:           map[string]error{"ufw": errors.New("ssh: connection reset by peer")},
+		checkErrAfterApply: map[string]bool{"ufw": true},
+	}
+	led := Run(context.Background(), f, []Step{step("ufw")}, RunOpts{Confirm: alwaysYes})
+
+	if led[0].State != StateFailed {
+		t.Fatalf("state = %q, want %q", led[0].State, StateFailed)
+	}
+	if led[0].Err == nil {
+		t.Error("failed step carries no error to show the user")
+	}
+	if len(f.applied) != 1 {
+		t.Errorf("applied = %v, want exactly one apply before the connection died", f.applied)
 	}
 }
 
