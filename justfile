@@ -9,12 +9,36 @@ default: serve
 serve: web
     go run -tags embedweb ./cmd/swarmd -config {{config}}
 
-# backend only, no UI (API on listen addr) — pair with `just dev`
+# `just dev` starts its own backend now; use this when you want it in the
+# foreground of this shell instead.
+
+# backend only, no UI (API on listen addr)
 run:
     go run ./cmd/swarmd -config {{config}}
 
-# frontend dev server: hot reload, proxies /api -> :8888 (run `just run` too)
+# The backend used to be your problem: `just dev` started only vite and assumed
+# you had `just run` going in another pane. That bit twice in one evening —
+# swarmd reads swarm.yaml once at startup, so a `stc bootstrap` that had just
+# added a node (or rewritten fiona's mount) was invisible to a dashboard still
+# running the old config, and nothing in the UI hinted the backend was stale.
+# Restarting it here makes "did I restart it?" a question you never have to ask.
+#
+# NB: the doc comment `just --list` shows is the LAST contiguous comment line
+# above the recipe, so the rationale lives above this blank line.
+
+# frontend dev server + a FRESH backend on :8888 (tmux 'stdash-dev')
 dev:
+    # Kill the tmux session, not a `pkill -f 'go run ...'` pattern: the shell
+    # running that pkill has the pattern in its OWN command line, so it matches
+    # and kills the caller — this recipe took itself out exactly once. The
+    # session owns the process group, so killing it takes the child binary too.
+    -tmux kill-session -t stdash-dev 2>/dev/null
+    # ...and the deployed binary, if `just deploy` is holding :8888. Matched by
+    # process NAME (-x), which never matches this shell.
+    -pkill -x swarmd 2>/dev/null
+    sleep 1
+    tmux new-session -d -s stdash-dev "exec go run ./cmd/swarmd -config {{config}}"
+    @echo "backend restarted on :8888 in tmux 'stdash-dev' — logs: tmux attach -t stdash-dev"
     pnpm --dir web run dev
 
 # build frontend into internal/webui/dist
