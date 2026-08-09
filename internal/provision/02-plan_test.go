@@ -385,6 +385,64 @@ func TestSuggestMountpoint(t *testing.T) {
 	}
 }
 
+// A Raspberry Pi's SD card reports TRAN=mmc HOTPLUG=1, which is
+// indistinguishable from removable storage by the hotplug flag alone. fiona
+// boots from an SSD and still has its old boot card in the slot; offering to
+// mount that card at /mnt/rootfs is nonsense, and worse, declining the step
+// used to block the whole install.
+func TestUnmountedDrivesIgnoresMMC(t *testing.T) {
+	p := &Probe{
+		Disks: []BlockDevice{{
+			Name: "mmcblk0", Path: "/dev/mmcblk0", Type: "disk",
+			Tran: "mmc", Hotplug: true, Size: 31_000_000_000,
+			Children: []BlockDevice{
+				{Name: "mmcblk0p1", Path: "/dev/mmcblk0p1", Type: "part", FSType: "vfat", UUID: "0B22-2966"},
+				{Name: "mmcblk0p2", Path: "/dev/mmcblk0p2", Type: "part", FSType: "ext4", UUID: "3ad7386b-e1ae-4032-ae33-0c40f5ecc4ac"},
+			},
+		}},
+	}
+	if got := p.UnmountedDrives(); len(got) != 0 {
+		t.Errorf("SD card offered as a data drive: %+v", got)
+	}
+}
+
+// The real case must keep working: a USB disk plugged into a headless box does
+// not auto-mount, and finding it is the whole point of the check.
+func TestUnmountedDrivesFindsUSB(t *testing.T) {
+	p := &Probe{
+		Disks: []BlockDevice{{
+			Name: "sdb", Path: "/dev/sdb", Type: "disk",
+			Tran: "usb", Hotplug: true, Rota: true, Size: 500_000_000_000,
+			Children: []BlockDevice{
+				{Name: "sdb1", Path: "/dev/sdb1", Type: "part", FSType: "ext4", UUID: "aaaa-bbbb"},
+			},
+		}},
+	}
+	got := p.UnmountedDrives()
+	if len(got) != 1 || got[0].Device != "/dev/sdb1" {
+		t.Fatalf("USB drive not found: %+v", got)
+	}
+}
+
+// A partition already described by fstab is configured storage, not something
+// awaiting adoption — it is unmounted right now for a reason (a drive that is
+// powered off, a mount that failed this boot), and re-adding it to fstab would
+// duplicate the entry.
+func TestUnmountedDrivesSkipsFstabbedPartitions(t *testing.T) {
+	p := &Probe{
+		Disks: []BlockDevice{{
+			Name: "sdb", Path: "/dev/sdb", Type: "disk", Tran: "usb", Hotplug: true,
+			Children: []BlockDevice{
+				{Name: "sdb1", Path: "/dev/sdb1", Type: "part", FSType: "ext4", UUID: "aaaa-bbbb"},
+			},
+		}},
+		Fstab: []string{"UUID=aaaa-bbbb\t/srv/data\text4\tdefaults,nofail\t0\t0"},
+	}
+	if got := p.UnmountedDrives(); len(got) != 0 {
+		t.Errorf("already-fstabbed partition offered as a new drive: %+v", got)
+	}
+}
+
 // The rule that killed rue.
 //
 // rue was a Pi 1 B+ with a bus-powered 2.5" HDD. The board caps its ENTIRE USB

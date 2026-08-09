@@ -346,11 +346,24 @@ func (p *Probe) UnmountedDrives() []Drive {
 			continue
 		}
 		// Removable media only — never offer to mount an unmounted OS partition.
-		if disk.Tran != "usb" && !disk.Hotplug {
+		//
+		// Hotplug alone is not enough. A Raspberry Pi's SD card reports
+		// TRAN=mmc HOTPLUG=1, so a box that has been migrated to an SSD and
+		// still has its old boot card in the slot had that dead card offered as
+		// two mount steps (/mnt/bootfs, /mnt/rootfs). Declining them then
+		// blocked the syncthing install outright. mmc is never the data drive
+		// on these boxes: it is the boot media, mounted or spare.
+		if disk.Tran != "usb" && (!disk.Hotplug || disk.Tran == "mmc") {
 			continue
 		}
 		for _, part := range disk.Children {
 			if part.FSType == "" || part.FSType == "swap" || part.Mountpoint != "" {
+				continue
+			}
+			// Already in fstab: configured storage that happens to be unmounted
+			// right now (drive powered off, mount failed this boot). Adopting it
+			// would append a second fstab line for the same UUID.
+			if p.InFstab(part.UUID) {
 				continue
 			}
 			out = append(out, Drive{
