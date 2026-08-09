@@ -65,6 +65,38 @@ func TestSyncthingGUICheckAssertsTheTailnetBind(t *testing.T) {
 	}
 }
 
+// PlanSyncthing used to short-circuit to (nil, nil) for a node that LOOKED
+// fully configured (Present && enabled && active) before a single Check ran.
+// That coarse gate raced the per-step Checks below it: a node that installed
+// and started syncthing fine but whose syncthing-gui step failed — GUI still
+// on 127.0.0.1 — passed the coarse gate on the next run (the SERVICE really
+// is present/enabled/active; only the GUI bind is wrong) and PlanSyncthing
+// returned an empty step list. An empty ledger then reads as "nothing to
+// join" rather than "one step still needs repair" — see stageSyncthing and
+// Ledger.Satisfied's doc comment for why an absent ID is satisfied by
+// default. The fix deletes the coarse gate; this pins that all three steps
+// are still returned (and still checkable) for a present-and-active node —
+// they are simply expected to each report `already` once actually run
+// against a box in that state.
+func TestPlanSyncthingStillReturnsAllStepsWhenAlreadyRunning(t *testing.T) {
+	p := syncProbe()
+	p.Syncthing.Present = true
+	p.Syncthing.Enabled = "enabled"
+	p.Syncthing.Active = "active"
+
+	steps, err := PlanSyncthing(p, syncLayout())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"syncthing-install", "syncthing-service", "syncthing-gui"} {
+		if stepByID(steps, id) == nil {
+			t.Errorf("PlanSyncthing on a present+enabled+active node dropped step %q — "+
+				"a half-configured node (e.g. gui step previously failed) could no longer "+
+				"be repaired by a re-run", id)
+		}
+	}
+}
+
 func TestSyncthingStepsChainTheirNeeds(t *testing.T) {
 	steps, _ := PlanSyncthing(syncProbe(), syncLayout())
 	want := map[string][]string{

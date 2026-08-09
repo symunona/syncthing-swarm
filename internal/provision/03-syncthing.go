@@ -69,10 +69,23 @@ func PlanSyncthing(p *Probe, l SyncthingLayout) ([]Step, error) {
 	if err != nil {
 		return nil, err
 	}
-	if p.Syncthing.Present && p.Syncthing.Enabled == "enabled" && p.Syncthing.Active == "active" {
-		return nil, nil // already running
-	}
-
+	// No coarse "already running, stop here" gate. There used to be one — this
+	// exact three-field check — and it competed with the per-step Checks below,
+	// which already report `already` for a fully-configured node on their own.
+	// The coarse gate is what let a half-configured node get stuck: run 1
+	// installs and starts syncthing but the syncthing-gui step fails, leaving
+	// the GUI bound to 127.0.0.1; run 2 sees Present && enabled && active (all
+	// true — the SERVICE is fine, only the GUI bind is wrong) and returns nil
+	// steps before a single Check runs. An empty step list means an empty
+	// ledger, which means led.Failed() is empty and led.Satisfied
+	// ("syncthing-service") is true (an ID with no row counts as satisfied —
+	// see Ledger.Satisfied), so stageSyncthing proceeds to join the swarm and
+	// writes url: http://<tailnet-ip>:8384 into swarm.yaml for a GUI that is
+	// NOT listening there. The mesh step then fails against a node the wizard
+	// just finished recording as good. Letting the three Checks decide instead
+	// means syncthing-install and syncthing-service report `already` (cheap,
+	// nothing to redo) while syncthing-gui correctly reports outstanding and
+	// gets repaired.
 	v := SyncthingRelease
 	base := fmt.Sprintf("https://github.com/syncthing/syncthing/releases/download/v%s", v)
 	pkg := fmt.Sprintf("syncthing-%s-v%s", arch, v)

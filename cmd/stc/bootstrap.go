@@ -252,9 +252,6 @@ func stageSyncthing(ctx context.Context, ssh *provision.SSH, p *provision.Probe,
 	die(err)
 
 	fmt.Printf("\n  ── syncthing on %s ──\n\n", nodeName)
-	if len(steps) == 0 {
-		fmt.Println("  syncthing already installed and running.")
-	}
 	for i, s := range steps {
 		fmt.Printf("  %d. %s\n", i+1, s.Title)
 		fmt.Printf("     %s\n", strings.ReplaceAll(s.Why, "\n    ", "\n     "))
@@ -266,9 +263,24 @@ func stageSyncthing(ctx context.Context, ssh *provision.SSH, p *provision.Probe,
 	st := provision.NewStyle(os.Stdout) // stageSyncthing has no style of its own yet
 
 	led := provision.Run(ctx, provision.SSHExecutor{S: ssh, Out: os.Stdout}, steps, provision.RunOpts{
-		Confirm: func(s provision.Step) bool { return confirm(in, s, yes) },
-		Report:  stepReporter(st),
+		Confirm: func(s provision.Step) bool {
+			fmt.Printf("  %s %s\n", st.Cyan("→"), s.Title)
+			if s.Warn != "" {
+				fmt.Printf("     %s %s\n", st.Yellow("⚠"), s.Warn)
+			}
+			return confirm(in, s, yes)
+		},
+		Report: stepReporter(st),
 	})
+	// PlanSyncthing no longer short-circuits on a coarse "already running"
+	// check (see its doc comment) — it always returns all three steps and lets
+	// their Checks decide. So "already installed and running" is now judged
+	// from the LEDGER, after the Checks have spoken, rather than from an empty
+	// step list that would never occur: every row must have landed on
+	// `already` for that to be true.
+	if len(led) > 0 && led.Count(provision.StateAlready) == len(led) {
+		fmt.Println("  syncthing already installed and running.")
+	}
 	printLedger(os.Stdout, st, led)
 
 	if len(led.Failed()) > 0 || !led.Satisfied("syncthing-service") {

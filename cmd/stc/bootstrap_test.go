@@ -79,6 +79,47 @@ func TestBootstrapDoesNotGateSyncthingOnAnEmptyPlan(t *testing.T) {
 	}
 }
 
+// stageSyncthing's Confirm closure used to prompt with a bare "apply? [y/N]:"
+// and nothing else — unlike cmdBootstrap's, which echoes "→ <title>" and any
+// Warn first. On the next real run against actual hardware, the operator
+// would face three bare prompts for the syncthing install/service/gui steps
+// with no idea which step they were being asked about. This is a source grep,
+// not a behavioural pin, for the same reason
+// TestBootstrapDoesNotGateSyncthingOnAnEmptyPlan is: stageSyncthing dials a
+// real *provision.SSH and calls os.Exit on error, so it is not callable here.
+func TestStageSyncthingConfirmEchoesBeforePrompting(t *testing.T) {
+	src, err := os.ReadFile("bootstrap.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := functionBody(t, string(src), "func stageSyncthing")
+	if !strings.Contains(body, `st.Cyan("→")`) {
+		t.Error("stageSyncthing's Confirm closure does not echo the step title before " +
+			"prompting, unlike cmdBootstrap's")
+	}
+	if !strings.Contains(body, "s.Warn") {
+		t.Error("stageSyncthing's Confirm closure does not echo a step's Warn before prompting")
+	}
+}
+
+// functionBody extracts one top-level function's source, from its signature up
+// to (not including) the next top-level `func `. Good enough for a grep test
+// that needs to look inside ONE function rather than the whole file — bare
+// substring matching against the whole file cannot tell stageSyncthing's
+// Confirm closure apart from cmdBootstrap's, now that both echo the same way.
+func functionBody(t *testing.T, src, funcSig string) string {
+	t.Helper()
+	i := strings.Index(src, funcSig)
+	if i < 0 {
+		t.Fatalf("could not find %q in bootstrap.go", funcSig)
+	}
+	rest := src[i+len(funcSig):]
+	if j := strings.Index(rest, "\nfunc "); j >= 0 {
+		return rest[:j]
+	}
+	return rest
+}
+
 // confirmDiff is the one piece of the upsert flow that does not touch ssh or
 // the filesystem, so it is the one piece this task can pin behaviourally: a
 // stale swarm.yaml entry (fiona, rebuilt onto a new SSD, with a new drive
