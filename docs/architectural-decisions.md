@@ -41,3 +41,25 @@ all without one.
 
 **Cost.** None. The `Needs` graph stays within a single stage, which is also what
 keeps it sparse enough not to re-create the deadlock this work removes.
+
+## 2026-08-09 — ssh exit 255 is a transport failure, never a predicate answer
+
+**Context.** `SSHExecutor.Satisfied` runs a step's `Check` over ssh and maps the
+exit status to a boolean: zero means the box is already in the wanted state,
+non-zero means it is not. But ssh reports its OWN failures — unreachable host,
+dropped connection, auth failure — as exit status 255, which arrives through
+`exec.Cmd` looking exactly like a predicate that answered "no".
+
+**Decision.** Only exit codes 0–254 count as the predicate answering. 255 is
+surfaced as an error, and the step is recorded failed with "could not reach the
+box".
+
+**Why.** The two ways of being wrong are not symmetric. Reading a dead
+connection as "not satisfied" makes the wizard offer to re-apply finished work
+on a box it can no longer reach — the same class of failure this whole plan
+exists to remove. Reading a genuine 255 from a remote command as "cannot verify"
+merely asks the user to look. Every `Check` in this codebase is `test`, `grep`,
+`findmnt`, `command -v` or `systemctl is-active`; none of them exit 255.
+
+**Cost.** One exit-code comparison, and two tests for the transport-error paths
+that the original test fake could not reach at all.
