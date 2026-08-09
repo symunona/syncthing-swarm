@@ -86,3 +86,22 @@ condition. The mechanism underneath it (a skipped step blocks only its dependent
 is properly tested in `TestRunBlocksOnlyDependents`, and the end-to-end proof is
 provisioning a real box. Making the wizard unit-testable means injecting the ssh
 transport — worth doing, but not inside this change.
+
+## 2026-08-09 — the pinned syncthing release is a floor
+
+**Context.** `SyncthingRelease` pins the version new nodes install, and the
+install `Check` asserted equality. But tarball installs deliberately keep
+syncthing's auto-upgrade enabled, so a healthy node moves ahead of the pin on
+its own — fiona came up on 2.1.2 with 2.1.3 released and a 12-hour upgrade
+interval.
+
+**Decision.** The pin is a floor. The Check compares with `sort -V` and accepts
+any installed version `>=` the constant.
+
+**Why.** Equality plus auto-upgrade is a loop: the node upgrades itself, the
+check reads false, the wizard reinstalls the older pin over a newer working
+binary, and auto-upgrade undoes it — every run, forever. A floor expresses what
+was actually meant: never provision a node older than this.
+
+**Cost.** A version comparison in shell instead of a grep. Bump the constant when
+new nodes should start current; existing nodes need no help.
