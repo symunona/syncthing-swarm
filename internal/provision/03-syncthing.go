@@ -114,6 +114,10 @@ func PlanSyncthing(p *Probe, l SyncthingLayout) ([]Step, error) {
 			// service around it — this is the ARMv6/ARMv7 trap, caught early
 			"sudo -u " + l.User + " /usr/local/bin/syncthing --version",
 		},
+		Check: []string{
+			fmt.Sprintf("/usr/local/bin/syncthing --version 2>/dev/null | grep -q 'v%s'", v),
+			"test -f /etc/systemd/system/syncthing@.service",
+		},
 	})
 
 	// dirs, owned by the user that runs syncthing (uid must match what is already
@@ -154,6 +158,13 @@ func PlanSyncthing(p *Probe, l SyncthingLayout) ([]Step, error) {
 			"systemctl restart "+unit,
 			"systemctl is-active --quiet "+unit,
 		),
+		Needs: []string{"syncthing-install"},
+		Check: []string{
+			fmt.Sprintf("test -d %s", l.DataDir),
+			fmt.Sprintf("test -d %s", l.FolderDir),
+			fmt.Sprintf("grep -q -- '--data=%s' /etc/systemd/system/%s.service.d/override.conf", l.DataDir, unit),
+			"systemctl is-active --quiet " + unit,
+		},
 	})
 
 	// The GUI must listen on the tailnet address ONLY. Binding 0.0.0.0 would put
@@ -183,6 +194,11 @@ func PlanSyncthing(p *Probe, l SyncthingLayout) ([]Step, error) {
 				l.TailnetIP, l.ConfigDir),
 			fmt.Sprintf("grep -q '<address>%s:8384</address>' %s/config.xml", l.TailnetIP, l.ConfigDir),
 			"systemctl start " + unit,
+			"systemctl is-active --quiet " + unit,
+		},
+		Needs: []string{"syncthing-service"},
+		Check: []string{
+			fmt.Sprintf("grep -q '<address>%s:8384</address>' %s/config.xml", l.TailnetIP, l.ConfigDir),
 			"systemctl is-active --quiet " + unit,
 		},
 	})
