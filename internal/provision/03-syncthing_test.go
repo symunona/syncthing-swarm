@@ -79,3 +79,34 @@ func TestSyncthingStepsChainTheirNeeds(t *testing.T) {
 		}
 	}
 }
+
+// The service Check must inspect the running process's cmdline, not just the file.
+// A deployment interrupted between writing override.conf and daemon-reload+restart
+// would leave the unit active but still using the old data directory.
+func TestSyncthingServiceCheckInspectsRunningProcess(t *testing.T) {
+	steps, _ := PlanSyncthing(syncProbe(), syncLayout())
+	s := stepByID(steps, "syncthing-service")
+	if s == nil {
+		t.Fatal("no syncthing-service step")
+	}
+	joined := strings.Join(s.Check, " ")
+	if !strings.Contains(joined, "/proc") || !strings.Contains(joined, "MainPID") {
+		t.Errorf("service check does not inspect running process: %v", s.Check)
+	}
+}
+
+// The GUI Check must verify the live listening socket is on the tailnet address,
+// not just that config.xml says so. A sed interrupted before systemctl restart
+// would leave the socket on 127.0.0.1.
+func TestSyncthingGUICheckInspectsLiveSocket(t *testing.T) {
+	l := syncLayout()
+	steps, _ := PlanSyncthing(syncProbe(), l)
+	s := stepByID(steps, "syncthing-gui")
+	if s == nil {
+		t.Fatal("no syncthing-gui step")
+	}
+	joined := strings.Join(s.Check, " ")
+	if !strings.Contains(joined, "ss") || !strings.Contains(joined, l.TailnetIP+":8384") {
+		t.Errorf("gui check does not inspect live socket: %v", s.Check)
+	}
+}

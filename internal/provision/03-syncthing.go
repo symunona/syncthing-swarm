@@ -115,7 +115,9 @@ func PlanSyncthing(p *Probe, l SyncthingLayout) ([]Step, error) {
 			"sudo -u " + l.User + " /usr/local/bin/syncthing --version",
 		},
 		Check: []string{
-			fmt.Sprintf("/usr/local/bin/syncthing --version 2>/dev/null | grep -q 'v%s'", v),
+			// Anchor the version to avoid matching v2.1.20 when looking for v2.1.2.
+			// The --version output format is "syncthing v2.1.2" followed by other info.
+			fmt.Sprintf("/usr/local/bin/syncthing --version 2>/dev/null | grep -qE 'v%s([^0-9.]|$)'", v),
 			"test -f /etc/systemd/system/syncthing@.service",
 		},
 	})
@@ -162,7 +164,13 @@ func PlanSyncthing(p *Probe, l SyncthingLayout) ([]Step, error) {
 		Check: []string{
 			fmt.Sprintf("test -d %s", l.DataDir),
 			fmt.Sprintf("test -d %s", l.FolderDir),
-			fmt.Sprintf("grep -q -- '--data=%s' /etc/systemd/system/%s.service.d/override.conf", l.DataDir, unit),
+			// Verify the running process carries the right --data flag, not just the file.
+			// A run interrupted between writing override.conf and daemon-reload+restart
+			// would leave a unit active from its previous state. We check /proc/<pid>/cmdline
+			// to prove the live process reflects the desired configuration. This is
+			// world-readable, so no sudo needed; a dead unit reports MainPID 0 and the
+			// check correctly fails.
+			fmt.Sprintf("tr '\\0' ' ' < /proc/$(systemctl show -p MainPID --value %s)/cmdline | grep -q -- '--data=%s'", unit, l.DataDir),
 			"systemctl is-active --quiet " + unit,
 		},
 	})
@@ -198,7 +206,12 @@ func PlanSyncthing(p *Probe, l SyncthingLayout) ([]Step, error) {
 		},
 		Needs: []string{"syncthing-service"},
 		Check: []string{
+			// Verify config.xml has the right bind address — this is what survives a restart.
 			fmt.Sprintf("grep -q '<address>%s:8384</address>' %s/config.xml", l.TailnetIP, l.ConfigDir),
+			// Verify the live listening socket is on the tailnet address, not just that
+			// config.xml says so. A sed interrupted before systemctl restart would leave
+			// the socket on 127.0.0.1. `ss` listing does not need root (only -p would).
+			fmt.Sprintf("ss -tlnH 'sport = :8384' | grep -q '%s:8384'", l.TailnetIP),
 			"systemctl is-active --quiet " + unit,
 		},
 	})
