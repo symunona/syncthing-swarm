@@ -22,14 +22,6 @@ type JoinResult struct {
 	YamlPath   string
 }
 
-// AppendNode is a thin compatibility wrapper around the unexported appendNode.
-// The only caller is cmd/stc/bootstrap.go:266, which Task 7 rewires to call
-// UpsertNode directly — this wrapper exists only to keep the build green
-// between this commit and that one, and Task 7 deletes it.
-func AppendNode(path string, n config.Node) error {
-	return appendNode(path, n)
-}
-
 // FieldChange is one scalar that an upsert would rewrite.
 type FieldChange struct{ Field, Old, New string }
 

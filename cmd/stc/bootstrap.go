@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -114,45 +115,82 @@ func cmdBootstrap(args []string) {
 	fmt.Println("  touches this program, a config file, or a log.")
 	fmt.Println()
 
-	applied, skipped := 0, 0
-	for i, s := range steps {
-		fmt.Printf("  [%d/%d] %s\n", i+1, len(steps), s.Title)
-		if s.Warn != "" {
-			fmt.Printf("     ⚠ %s\n", s.Warn)
-		}
-		if !confirm(in, s, *yes) {
-			fmt.Println("     skipped.")
-			skipped++
-			continue
-		}
-		if err := provision.Apply(ctx, ssh, s, os.Stdout); err != nil {
-			fmt.Printf("     ✗ %v\n", err)
-			fmt.Println("     stopping. The box is the state — fix the cause and re-run;")
-			fmt.Println("     the probe will pick up from wherever reality actually is.")
-			os.Exit(1)
-		}
-		fmt.Println("     ✓ done")
-		applied++
-	}
+	st := provision.NewStyle(os.Stdout)
+	ex := provision.SSHExecutor{S: ssh, Out: os.Stdout}
 
-	fmt.Printf("\n  applied %d, skipped %d. Re-probing to verify…\n", applied, skipped)
-	p2, err := provision.RunProbe(ctx, ssh, provision.ProbeOpts{}, nil)
-	die(err)
-	remaining, _ := provision.Plan(p2, p2.Box.User)
-	if len(remaining) > 0 {
-		fmt.Printf("  %d step(s) still outstanding — fix these before syncthing:\n", len(remaining))
-		for _, s := range remaining {
-			fmt.Printf("  • %s\n", s.Title)
-		}
-		return
-	}
-	fmt.Println("  ✓ verified: hardening complete.")
+	led := provision.Run(ctx, ex, steps, provision.RunOpts{
+		Confirm: func(s provision.Step) bool {
+			fmt.Printf("  %s %s\n", st.Cyan("→"), s.Title)
+			if s.Warn != "" {
+				fmt.Printf("     %s %s\n", st.Yellow("⚠"), s.Warn)
+			}
+			return confirm(in, s, *yes)
+		},
+		Report: stepReporter(st),
+	})
+
+	printLedger(os.Stdout, st, led)
 
 	if !*syncthing {
 		fmt.Println("\n  (pass -syncthing to install syncthing and join the swarm)")
 		return
 	}
+
+	// Re-probe: the hardening just changed the box, and the syncthing layout is
+	// derived from what is mounted NOW.
+	p2, err := provision.RunProbe(ctx, ssh, provision.ProbeOpts{}, nil)
+	die(err)
+
+	// Advisory, not blocking. Declining a step you do not want must never cost
+	// you the install — that is exactly the deadlock this replaces: an SD card
+	// wrongly offered as a data drive, declined, and syncthing never installed.
+	// The one hard requirement is a mounted data drive, which layoutFor enforces.
+	for _, r := range led {
+		if r.State == provision.StateSkipped || r.State == provision.StateFailed || r.State == provision.StateBlocked {
+			fmt.Printf("  %s %s did not complete — continuing to syncthing anyway\n",
+				st.Yellow("⚠"), r.Step.Title)
+		}
+	}
+
 	stageSyncthing(ctx, ssh, p2, in, *cfgPath, dest, *node, *yes)
+}
+
+// stepReporter narrates a run as it happens. The ledger printed afterwards is
+// the receipt; this is the live commentary, and both use the same glyphs so a
+// line means the same thing wherever it appears.
+func stepReporter(st provision.Style) func(provision.Result) {
+	return func(r provision.Result) {
+		switch r.State {
+		case provision.StateAlready:
+			fmt.Printf("  %s %s %s\n", st.Mark(r.State), r.Step.Title, st.Dim("(already done)"))
+		case provision.StateOK:
+			fmt.Printf("  %s %s\n", st.Mark(r.State), r.Step.Title)
+		case provision.StateSkipped:
+			fmt.Printf("  %s %s %s\n", st.Mark(r.State), r.Step.Title, st.Dim("(skipped)"))
+		case provision.StateBlocked:
+			fmt.Printf("  %s %s %s\n", st.Mark(r.State), r.Step.Title, st.Dim(r.Err.Error()))
+		case provision.StateFailed:
+			fmt.Printf("  %s %s\n     %s\n", st.Mark(r.State), r.Step.Title, st.Red(r.Err.Error()))
+		}
+	}
+}
+
+// printLedger is the run's receipt. A skipped or failed step is not a reason to
+// hide everything else that worked — the wizard's old behaviour of stopping
+// dead meant a run's only output was its first problem.
+func printLedger(w io.Writer, st provision.Style, led provision.Ledger) {
+	fmt.Fprintf(w, "\n  ── result ──\n\n")
+	for _, r := range led {
+		fmt.Fprintf(w, "  %s %-12s %s\n", st.Mark(r.State), r.State, r.Step.Title)
+	}
+	fmt.Fprintf(w, "\n  %d ok, %d already, %d skipped, %d failed, %d blocked\n",
+		led.Count(provision.StateOK), led.Count(provision.StateAlready),
+		led.Count(provision.StateSkipped), led.Count(provision.StateFailed),
+		led.Count(provision.StateBlocked))
+	if f := led.Failed(); len(f) > 0 {
+		fmt.Fprintf(w, "\n  %s the box is the state — fix the cause and re-run; the probe picks up\n"+
+			"    from wherever reality actually is, and finished steps cost nothing.\n", st.Yellow("⚠"))
+	}
 }
 
 // layoutFor decides where syncthing's pieces live on this node: config on the
@@ -225,17 +263,17 @@ func stageSyncthing(ctx context.Context, ssh *provision.SSH, p *provision.Probe,
 		}
 		fmt.Println()
 	}
-	for i, s := range steps {
-		fmt.Printf("  [%d/%d] %s\n", i+1, len(steps), s.Title)
-		if !confirm(in, s, yes) {
-			fmt.Println("     skipped — stopping (the later steps depend on this one).")
-			return
-		}
-		if err := provision.Apply(ctx, ssh, s, os.Stdout); err != nil {
-			fmt.Printf("     ✗ %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println("     ✓ done")
+	st := provision.NewStyle(os.Stdout) // stageSyncthing has no style of its own yet
+
+	led := provision.Run(ctx, provision.SSHExecutor{S: ssh, Out: os.Stdout}, steps, provision.RunOpts{
+		Confirm: func(s provision.Step) bool { return confirm(in, s, yes) },
+		Report:  stepReporter(st),
+	})
+	printLedger(os.Stdout, st, led)
+
+	if len(led.Failed()) > 0 || !led.Satisfied("syncthing-service") {
+		fmt.Printf("\n  %s syncthing is not running — not joining the swarm. Re-run when it is.\n", st.Red("✗"))
+		return
 	}
 
 	// --- stage 4: join the swarm --------------------------------------------
@@ -263,8 +301,21 @@ func stageSyncthing(ctx context.Context, ssh *provision.SSH, p *provision.Probe,
 		return
 	}
 
-	die(provision.AppendNode(cfgPath, newNode))
-	fmt.Printf("  ✓ appended to %s\n", cfgPath)
+	changes, exists, err := provision.DiffNode(cfgPath, newNode)
+	die(err)
+	if exists && len(changes) == 0 {
+		fmt.Printf("  %s %s already in %s, unchanged\n", st.Mark(provision.StateAlready), nodeName, cfgPath)
+	} else {
+		if exists {
+			fmt.Printf("\n  %s is already in %s and this run found different values:\n\n", nodeName, cfgPath)
+			if !confirmDiff(in, changes, yes) {
+				fmt.Println("  skipped. The node is installed but swarm.yaml still describes the old box.")
+				return
+			}
+		}
+		die(provision.UpsertNode(cfgPath, newNode))
+		fmt.Printf("  %s wrote %s to %s\n", st.Mark(provision.StateOK), nodeName, cfgPath)
+	}
 
 	cfg, err := config.Load(cfgPath)
 	die(err)
@@ -280,6 +331,24 @@ func stageSyncthing(ctx context.Context, ssh *provision.SSH, p *provision.Probe,
 		fmt.Printf("  ✗ %s: %s (re-run to finish — a partial mesh is incomplete, not corrupt)\n", node, e)
 	}
 	fmt.Printf("\n  %s is in the swarm. No folders shared — do that from the dashboard.\n", nodeName)
+}
+
+// confirmDiff prints a field-by-field diff of what UpsertNode would rewrite
+// and asks once before doing it — a node outlives its hardware (fiona came
+// back from an SD-card rebuild with a new drive path and a new API key), and
+// swarm.yaml should not be silently overwritten just because the box answers
+// to the same name it used to.
+func confirmDiff(in *bufio.Reader, changes []provision.FieldChange, yes bool) bool {
+	st := provision.NewStyle(os.Stdout)
+	for _, c := range changes {
+		old := c.Old
+		if old == "" {
+			old = "(unset)"
+		}
+		fmt.Printf("    %-7s %s → %s\n", c.Field, st.Dim(old), st.Green(c.New))
+	}
+	fmt.Println("\n  rewrite these values? (comments and other nodes are untouched)")
+	return confirmYN(in, yes)
 }
 
 func confirmYN(in *bufio.Reader, yes bool) bool {
