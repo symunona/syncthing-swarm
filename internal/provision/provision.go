@@ -154,19 +154,40 @@ type Mount struct {
 }
 
 type Security struct {
-	UFW                Tool     `json:"ufw"`
-	Fail2ban           Tool     `json:"fail2ban"`
-	UnattendedUpgrades Tool     `json:"unattendedUpgrades"`
-	Listening          []Socket `json:"listening"`
-	SSHDPort           int      `json:"sshdPort"` // the LIVE port — never assume 22
-	PasswordAuth       string   `json:"passwordAuth"`
-	PermitRootLogin    string   `json:"permitRootLogin"`
+	UFW                UFWStatus `json:"ufw"`
+	Fail2ban           Tool      `json:"fail2ban"`
+	UnattendedUpgrades Tool      `json:"unattendedUpgrades"`
+	Listening          []Socket  `json:"listening"`
+	SSHDPort           int       `json:"sshdPort"` // the LIVE port — never assume 22
+	PasswordAuth       string    `json:"passwordAuth"`
+	PermitRootLogin    string    `json:"permitRootLogin"`
 }
 
 type Tool struct {
 	Present bool   `json:"present"`
 	Enabled string `json:"enabled"` // enabled | disabled | not-found
 	Active  string `json:"active"`  // active | inactive | failed | unknown
+}
+
+// UFWStatus is ufw's Tool status plus whether the FIREWALL ITSELF is
+// actually up. Present/Enabled/Active describe the systemd unit
+// (ufw.service), and none of the three answer the question that matters:
+// is anything being filtered right now.
+//
+// ufw.service is Type=oneshot + RemainAfterExit=yes, and apt's postinst
+// enables AND starts it the moment the package is unpacked — entirely
+// independent of whether anyone ever ran `ufw enable`. So a box can show
+// Enabled=="enabled" and Active=="active" while /etc/ufw/ufw.conf still
+// says ENABLED=no and every connection sails through unfiltered. Keying
+// anything — the Plan gate, the `done` report — on the systemd fields
+// alone reproduces exactly the bug this type exists to fix, just moved up
+// one layer from is-active to is-enabled. FirewallUp is ufw's own
+// ENABLED=yes flag, read directly from ufw.conf (0644, no sudo needed),
+// and it is the only field here that is safe to treat as "the firewall is
+// on".
+type UFWStatus struct {
+	Tool
+	FirewallUp bool `json:"firewallUp"`
 }
 
 // Broken reports a service that is installed but crashed on startup.

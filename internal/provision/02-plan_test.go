@@ -541,7 +541,7 @@ func TestPlanNoSpindownOnFlash(t *testing.T) {
 func TestPlanIdempotentOnProvisionedBox(t *testing.T) {
 	p := parseFixture(t, "rue-pi1b.ndjson")
 	p.Inotify.MaxUserWatches = 524288
-	p.Security.UFW = Tool{Present: true, Enabled: "enabled"}
+	p.Security.UFW = UFWStatus{Tool: Tool{Present: true, Enabled: "enabled"}, FirewallUp: true}
 	p.Security.Fail2ban = Tool{Present: true, Enabled: "enabled"}
 	p.Security.UnattendedUpgrades = Tool{Present: true, Enabled: "enabled"}
 	p.Spindown = Spindown{Present: true, Enabled: "enabled"}
@@ -750,16 +750,26 @@ func TestAptUpdateChecksItsOwnStampNotPackageIndexMtime(t *testing.T) {
 	}
 }
 
-// ufw.service is Type=oneshot + RemainAfterExit=yes: apt's postinst starts it
-// the instant the package is unpacked, entirely independent of whether anyone
-// ever ran `ufw enable`. So Present alone (the old gate) is true on a box with
-// no firewall at all — and the wizard used to call that box DONE, reporting
-// "✓ ufw present (disabled)" while nothing was blocking a single connection.
+// ufw.service is Type=oneshot + RemainAfterExit=yes, and apt's postinst
+// ENABLES AND STARTS it the instant the package is unpacked — entirely
+// independent of whether anyone ever ran `ufw enable`. So on a box where
+// nobody ever enabled the firewall, Present, Enabled=="enabled" AND
+// Active=="active" can ALL read true: those are systemd's account of the
+// unit, not ufw's account of itself. An earlier version of this fix gated
+// on Enabled instead of Present, which reproduced the exact same bug one
+// layer up — apt's postinst enables the unit too, so that gate was ALSO
+// satisfied by a box with no firewall. FirewallUp (read from
+// /etc/ufw/ufw.conf's own ENABLED= flag, set only by `ufw enable`/`ufw
+// disable`) is the only field this drives through.
 func TestPlanInstalledButDisabledUFWStillProducesTheStep(t *testing.T) {
 	p := parseFixture(t, "rue-pi1b.ndjson")
-	// installed, and the oneshot unit is "active" (its postinst ran it once),
-	// but `ufw enable` itself was never run — the actual firewall is off.
-	p.Security.UFW = Tool{Present: true, Enabled: "disabled", Active: "active"}
+	// installed, and apt's postinst both enabled AND started the oneshot
+	// unit — but `ufw enable` itself was never run, so the actual firewall
+	// (ufw.conf's ENABLED flag) is off.
+	p.Security.UFW = UFWStatus{
+		Tool:       Tool{Present: true, Enabled: "enabled", Active: "active"},
+		FirewallUp: false,
+	}
 
 	steps, done := Plan(p, "symunona")
 	ufw := stepByID(steps, "ufw")

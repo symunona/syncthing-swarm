@@ -216,11 +216,30 @@ tool_json() {
 		"$present" "$(svc_state "$unit")" "$(jstr "$(svc_active "$unit")")"
 }
 
+# ufw_json is tool_json plus firewallUp: ufw's OWN enabled flag, read
+# straight from /etc/ufw/ufw.conf rather than inferred from systemd.
+#
+# The systemd unit (ufw.service) is Type=oneshot + RemainAfterExit=yes, and
+# apt's postinst enables AND starts it the moment the package lands —
+# regardless of whether anyone ever ran `ufw enable`. So present/enabled/
+# active can all read "yes, installed and running" on a box whose firewall
+# is not actually filtering anything. ENABLED=yes in ufw.conf is ufw's own
+# record of whether `ufw enable` (or `ufw disable`) was the last thing run,
+# and the file is 0644 — readable here with no sudo, same as everything
+# else in this probe.
+ufw_json() {
+	local present=false firewall_up=false
+	have ufw && present=true
+	grep -q '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null && firewall_up=true
+	printf '{"present":%s,"enabled":%s,"active":%s,"firewallUp":%s}' \
+		"$present" "$(svc_state ufw.service)" "$(jstr "$(svc_active ufw.service)")" "$firewall_up"
+}
+
 check_security() {
 	start
 	local ufw f2b unatt listen sshd_port sshd_pw sshd_root
 
-	ufw=$(tool_json ufw ufw.service)
+	ufw=$(ufw_json)
 	f2b=$(tool_json fail2ban-client fail2ban.service)
 	unatt=$(tool_json unattended-upgrade unattended-upgrades.service)
 

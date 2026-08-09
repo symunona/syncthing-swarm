@@ -132,8 +132,12 @@ func summarize(check string, p *Probe) string {
 		return strings.Join(miss, "; ")
 	case "security":
 		s := p.Security
+		ufwWord := toolWord(s.UFW.Tool)
+		if s.UFW.Present && !s.UFW.FirewallUp {
+			ufwWord += "/firewall-down" // installed+enabled unit, but ENABLED=no in ufw.conf
+		}
 		return fmt.Sprintf("ufw:%s  fail2ban:%s  unattended:%s  sshd:%d  %d listening",
-			toolWord(s.UFW), toolWord(s.Fail2ban), toolWord(s.UnattendedUpgrades),
+			ufwWord, toolWord(s.Fail2ban), toolWord(s.UnattendedUpgrades),
 			s.SSHDPort, len(s.Listening))
 	case "spindown":
 		if !p.Spindown.Present {
@@ -285,8 +289,13 @@ func (r *Renderer) Summary(p *Probe) {
 
 	// Security findings, smallest useful set.
 	var findings []string
-	if !p.Security.UFW.Present {
+	switch {
+	case !p.Security.UFW.Present:
 		findings = append(findings, "ufw not installed")
+	case !p.Security.UFW.FirewallUp:
+		// Present (and possibly systemd-enabled) is not the same as the
+		// firewall actually filtering — see UFWStatus's doc comment.
+		findings = append(findings, "ufw installed but not enabled — no firewall is actually up")
 	}
 	if !p.Security.Fail2ban.Present {
 		findings = append(findings, "fail2ban not installed")

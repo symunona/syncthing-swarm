@@ -297,17 +297,21 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 
 	// --- security ------------------------------------------------------------
 	// Additive and reversible only. Nothing here edits sshd_config.
-	// Key on the ENABLED state, not Present. ufw.service is Type=oneshot +
-	// RemainAfterExit=yes, and apt's postinst starts it the moment the package
-	// lands — entirely independent of whether anyone ever ran `ufw enable`. So
-	// an installed-but-never-enabled ufw has Present=true while the box has no
-	// firewall at all: `ufw enable` is what flips ENABLED=yes in
-	// /etc/ufw/ufw.conf (and, with it, the systemd enablement this wizard
-	// already probes into p.Security.UFW.Enabled). Gating on Present alone
-	// meant no step was ever planned for that box, and it was reported under
-	// `done` as "✓ ufw present (disabled)" — a box with no firewall, called
-	// finished.
-	if !p.Security.UFW.Present || p.Security.UFW.Enabled != "enabled" {
+	// Key on FirewallUp, not Present and not Enabled. ufw.service is
+	// Type=oneshot + RemainAfterExit=yes, and apt's postinst both enables AND
+	// starts it the moment the package lands — entirely independent of
+	// whether anyone ever ran `ufw enable`. So an installed ufw can show
+	// Present=true AND Enabled=="enabled" while the box has no firewall at
+	// all: those are systemd's account of the UNIT, not ufw's account of
+	// itself. Gating on Enabled (an earlier version of this fix) reproduced
+	// the exact bug it was meant to close, just one layer up from is-active.
+	// FirewallUp is read straight from /etc/ufw/ufw.conf's ENABLED= flag —
+	// the one thing `ufw enable`/`ufw disable` actually write — so it is the
+	// only field that answers "is anything being filtered right now". Gating
+	// on anything else meant no step was ever planned for an
+	// installed-but-never-enabled box, and it was reported under `done` as
+	// "✓ ufw present (enabled)" — a box with no firewall, called finished.
+	if !p.Security.UFW.FirewallUp {
 		port := p.Security.SSHDPort
 		steps = append(steps, Step{
 			ID:    "ufw",
@@ -351,7 +355,7 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 			Needs: []string{"apt-update"},
 		})
 	} else {
-		done = append(done, "ufw present ("+p.Security.UFW.Enabled+")")
+		done = append(done, "ufw present and enabled (firewall up)")
 	}
 
 	// fail2ban's sshd jail defaults to reading /var/log/auth.log — which does not
