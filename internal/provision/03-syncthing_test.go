@@ -183,3 +183,26 @@ func TestSyncthingGUIWaitsForTheSocketBeforeItEnds(t *testing.T) {
 		t.Errorf("socket wait at %d comes BEFORE the start at %d", waitAt, startAt)
 	}
 }
+
+// The pinned release is a FLOOR, not an exact version.
+//
+// Tarball installs deliberately leave syncthing's auto-upgrade ENABLED, so a
+// healthy node drifts AHEAD of SyncthingRelease on its own — fiona was on
+// 2.1.2 with 2.1.3 already out, and would have upgraded itself within 12h.
+// An install Check that demands equality would then read false on a node that
+// is correctly current, and the wizard would reinstall the older pin over it:
+// a downgrade on every run, which auto-upgrade undoes, forever.
+func TestSyncthingInstallCheckTreatsTheReleaseAsAFloor(t *testing.T) {
+	steps, _ := PlanSyncthing(syncProbe(), syncLayout())
+	s := stepByID(steps, "syncthing-install")
+	if s == nil {
+		t.Fatal("no syncthing-install step")
+	}
+	joined := strings.Join(s.Check, " ")
+	if !strings.Contains(joined, "sort -V") {
+		t.Errorf("install check does not compare versions, so a newer syncthing reads as wrong: %v", s.Check)
+	}
+	if strings.Contains(joined, "grep -qE 'v"+SyncthingRelease) {
+		t.Errorf("install check still demands an exact version match: %v", s.Check)
+	}
+}

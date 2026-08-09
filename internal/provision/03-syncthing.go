@@ -18,7 +18,10 @@ import (
 //     syncthing@<user>` works exactly as it would with a deb.
 //   - tarball installs keep syncthing's built-in auto-upgrade ENABLED (Debian
 //     packages disable it), so the box stays current instead of rotting.
-const SyncthingRelease = "2.1.2"
+//   - it is a FLOOR, not an exact version: auto-upgrade means a healthy node
+//     drifts ahead of it, and the install check accepts anything >= this. Bump it
+//     when you want NEW nodes to start current; existing nodes upgrade themselves.
+const SyncthingRelease = "2.1.3"
 
 // syncthingArch maps `uname -m` to an upstream release asset.
 func syncthingArch(unameM string) (string, error) {
@@ -130,7 +133,20 @@ func PlanSyncthing(p *Probe, l SyncthingLayout) ([]Step, error) {
 		Check: []string{
 			// Anchor the version to avoid matching v2.1.20 when looking for v2.1.2.
 			// The --version output format is "syncthing v2.1.2" followed by other info.
-			fmt.Sprintf("/usr/local/bin/syncthing --version 2>/dev/null | grep -qE 'v%s([^0-9.]|$)'", v),
+			// The pin is a FLOOR, not an equality.
+			//
+			// Tarball installs keep syncthing's auto-upgrade ENABLED on purpose, so a
+			// healthy node drifts AHEAD of this constant by design — fiona came up on
+			// 2.1.2 with 2.1.3 already released and a 12h upgrade interval. An equality
+			// check would read false on that node, and the wizard would reinstall the
+			// older pin over a newer, working syncthing: a downgrade every run, undone
+			// by auto-upgrade every time, forever.
+			//
+			// sort -V is the version comparison; the test is "the lowest of {floor,
+			// installed} is the floor", i.e. installed >= floor.
+			fmt.Sprintf("V=$(/usr/local/bin/syncthing --version 2>/dev/null | "+
+				"sed -n 's/^syncthing v\\([0-9][0-9.]*\\).*/\\1/p'); [ -n \"$V\" ] && "+
+				"[ \"$(printf '%%s\\n%%s\\n' '%s' \"$V\" | sort -V | head -n1)\" = '%s' ]", v, v),
 			"test -f /etc/systemd/system/syncthing@.service",
 		},
 	})
