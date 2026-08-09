@@ -216,6 +216,24 @@ func PlanSyncthing(p *Probe, l SyncthingLayout) ([]Step, error) {
 			fmt.Sprintf("grep -q '<address>%s:8384</address>' %s/config.xml", l.TailnetIP, l.ConfigDir),
 			"systemctl start " + unit,
 			"systemctl is-active --quiet " + unit,
+			// Wait for the GUI socket, do not race it.
+			//
+			// `systemctl start` returns and `is-active` goes true the moment the
+			// process forks, but syncthing needs another second or two to open its
+			// HTTP listener. The first real run of this wizard against fiona ended
+			// with the step doing everything correctly and then being recorded
+			// FAILED, because its own post-Check asked `ss` about the socket before
+			// syncthing had opened it. Measured there: is-active true immediately,
+			// socket open after 2s.
+			//
+			// A step may only be checked on what it has waited for. The fail2ban
+			// step and HarvestIdentity already learned this; the socket predicate
+			// was added later without the matching wait.
+			fmt.Sprintf("for i in $(seq 1 30); do ss -tlnH 'sport = :8384' | grep -q '%s:8384' && break; sleep 1; done",
+				l.TailnetIP),
+			// ...and fail loudly if it never came up, rather than leaving the
+			// post-Check to report a confusing "the box did not change".
+			fmt.Sprintf("ss -tlnH 'sport = :8384' | grep -q '%s:8384'", l.TailnetIP),
 		},
 		Needs: []string{"syncthing-service"},
 		Check: []string{

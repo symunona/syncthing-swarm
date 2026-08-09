@@ -142,3 +142,44 @@ func TestSyncthingGUICheckInspectsLiveSocket(t *testing.T) {
 		t.Errorf("gui check does not inspect live socket: %v", s.Check)
 	}
 }
+
+// The gui step must WAIT for syncthing's HTTP listener before it finishes.
+//
+// Found on the first real fiona run. `systemctl start` returns, `is-active`
+// goes true, and the step ends — but syncthing opens its GUI socket a second or
+// two LATER. The step's own post-Check then asked `ss` whether the tailnet
+// address was bound, got "not yet", and recorded a step that had in fact done
+// everything right as FAILED. Measured on fiona: is-active true immediately,
+// socket open after 2s.
+//
+// This is the same race the fail2ban step and HarvestIdentity already guard
+// against with explicit readiness loops; the socket predicate was added without
+// one. A Check may only assert what the step has already waited for.
+func TestSyncthingGUIWaitsForTheSocketBeforeItEnds(t *testing.T) {
+	l := syncLayout()
+	steps, _ := PlanSyncthing(syncProbe(), l)
+	s := stepByID(steps, "syncthing-gui")
+	if s == nil {
+		t.Fatal("no syncthing-gui step")
+	}
+
+	startAt, waitAt := -1, -1
+	for i, c := range s.Cmds {
+		if strings.HasPrefix(c, "systemctl start ") {
+			startAt = i
+		}
+		// a readiness loop: polls the socket and breaks out
+		if strings.Contains(c, "ss -tlnH") && strings.Contains(c, "sleep") && strings.Contains(c, l.TailnetIP) {
+			waitAt = i
+		}
+	}
+	if startAt < 0 {
+		t.Fatal("gui step never starts the unit")
+	}
+	if waitAt < 0 {
+		t.Fatal("gui step does not wait for the GUI socket — its own post-Check will race it")
+	}
+	if waitAt < startAt {
+		t.Errorf("socket wait at %d comes BEFORE the start at %d", waitAt, startAt)
+	}
+}
