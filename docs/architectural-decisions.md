@@ -63,3 +63,26 @@ merely asks the user to look. Every `Check` in this codebase is `test`, `grep`,
 
 **Cost.** One exit-code comparison, and two tests for the transport-error paths
 that the original test fake could not reach at all.
+
+## 2026-08-09 — the syncthing gate is a mounted drive, not an empty plan
+
+**Context.** `cmdBootstrap` used to re-probe after applying and return early if any
+step remained. Skipped and failed were indistinguishable, so declining a step you
+never wanted — an SD card wrongly offered as a data drive — permanently prevented
+the syncthing install. That is the bug that made a real fiona run install nothing.
+
+**Decision.** The hardening ledger no longer gates the syncthing stage. Unmet steps
+print a warning and the stage proceeds. The one hard requirement is a mounted data
+drive, enforced by `layoutFor` against a fresh probe.
+
+**Why.** Every other hardening step is advisory: hd-idle, inotify limits and ufw all
+improve a node without being preconditions for syncthing running correctly. A missing
+data drive is different in kind — without it the folders would land on the boot media,
+which is the failure the whole layout exists to prevent.
+
+**Known gap.** `cmdBootstrap` takes a concrete `*provision.SSH` and calls `os.Exit`,
+so this gate has no unit test; its regression guard greps the source for the old
+condition. The mechanism underneath it (a skipped step blocks only its dependents)
+is properly tested in `TestRunBlocksOnlyDependents`, and the end-to-end proof is
+provisioning a real box. Making the wizard unit-testable means injecting the ssh
+transport — worth doing, but not inside this change.
