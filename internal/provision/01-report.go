@@ -15,12 +15,13 @@ type Renderer struct {
 	w     io.Writer
 	tty   bool
 	dirty bool // a spinner/progress line is on screen and must be cleared
+	st    Style
 }
 
 func NewRenderer(w io.Writer) *Renderer {
 	f, ok := w.(*os.File)
 	tty := ok && isTerminal(f)
-	return &Renderer{w: w, tty: tty}
+	return &Renderer{w: w, tty: tty, st: NewStyle(w)}
 }
 
 func isTerminal(f *os.File) bool {
@@ -49,16 +50,16 @@ func (r *Renderer) Event(ev Event, p *Probe) {
 	}
 	r.clear()
 
-	mark, detail := "✓", ""
+	mark, detail := r.st.Green("✓"), ""
 	switch ev.State {
 	case "skip":
-		mark, detail = "-", ev.Note
+		mark, detail = r.st.Yellow("⊘"), r.st.Dim(ev.Note)
 	case "err":
-		mark, detail = "✗", ev.Note
+		mark, detail = r.st.Red("✗"), r.st.Dim(ev.Note)
 	default:
 		detail = summarize(ev.Check, p)
 	}
-	fmt.Fprintf(r.w, "  %s %-10s %-58s %5s\n", mark, ev.Check, truncate(detail, 58), fmt.Sprintf("%.1fs", float64(ev.MS)/1000))
+	fmt.Fprintf(r.w, "  %s %s %-58s %5s\n", mark, r.st.Cyan(fmt.Sprintf("%-10s", ev.Check)), truncate(detail, 58), fmt.Sprintf("%.1fs", float64(ev.MS)/1000))
 }
 
 // summarize is the one-line human form of a completed check.
@@ -227,7 +228,7 @@ func (r *Renderer) Summary(p *Probe) {
 			fmt.Fprintln(w)
 			return
 		}
-		fmt.Fprintln(w, "  ⚠ no external drive attached — syncthing folders would land on the boot media.")
+		fmt.Fprintf(w, "  %s no external drive attached — syncthing folders would land on the boot media.\n", r.st.Yellow("⚠"))
 		fmt.Fprintln(w, "    On a Pi that means the SD card: slow, and it wears out. Attach the drive first.")
 		return
 	}
@@ -318,7 +319,7 @@ func (r *Renderer) Summary(p *Probe) {
 	if len(findings) > 0 {
 		fmt.Fprintln(w, "  security")
 		for _, f := range findings {
-			fmt.Fprintf(w, "               • %s\n", f)
+			fmt.Fprintf(w, "               • %s\n", r.st.Yellow(f))
 		}
 	}
 	fmt.Fprintln(w)
