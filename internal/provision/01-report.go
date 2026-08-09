@@ -19,9 +19,8 @@ type Renderer struct {
 }
 
 func NewRenderer(w io.Writer) *Renderer {
-	f, ok := w.(*os.File)
-	tty := ok && isTerminal(f)
-	return &Renderer{w: w, tty: tty, st: NewStyle(w)}
+	st := NewStyle(w)
+	return &Renderer{w: w, tty: st.TTY(), st: st}
 }
 
 func isTerminal(f *os.File) bool {

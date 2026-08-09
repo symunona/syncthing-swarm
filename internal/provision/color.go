@@ -11,18 +11,26 @@ import (
 // is actively harmful in a log file, where escape sequences survive into
 // whatever greps the file later. So it switches itself off for anything that is
 // not a terminal, and honours NO_COLOR (https://no-color.org) even on one.
-type Style struct{ on bool }
+type Style struct {
+	isTTY bool // whether the output is to a terminal
+	on    bool // whether colour is enabled (isTTY and not NO_COLOR and not TERM=dumb)
+}
 
 func NewStyle(w io.Writer) Style {
 	f, ok := w.(*os.File)
 	if !ok {
 		return Style{}
 	}
-	return Style{on: colorEnabled(f)}
+	isTTY := isTerminal(f)
+	return Style{
+		isTTY: isTTY,
+		on:    isTTY && !colorDisabledByEnv(),
+	}
 }
 
-func colorEnabled(f *os.File) bool {
-	return !colorDisabledByEnv() && f != nil && isTerminal(f)
+// TTY reports whether this Style's output is to a terminal.
+func (s Style) TTY() bool {
+	return s.isTTY
 }
 
 // colorDisabledByEnv is split out so it can be tested without a terminal.
