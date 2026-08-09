@@ -65,15 +65,3 @@ func prefixWriter(w io.Writer, prefix string) io.Writer {
 	}()
 	return pw
 }
-
-// Verify re-probes the box and reports which steps actually took effect. The box
-// is the state — there is no state file and no resume bookkeeping, so a failed
-// or interrupted run is recovered by simply running the wizard again.
-func Verify(ctx context.Context, s *SSH, user string) (remaining []Step, err error) {
-	p, err := RunProbe(ctx, s, ProbeOpts{}, nil)
-	if err != nil {
-		return nil, err
-	}
-	steps, _ := Plan(p, user)
-	return steps, nil
-}
