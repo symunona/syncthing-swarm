@@ -14,6 +14,33 @@ type Step struct {
 	Cmds  []string // run in order, as root, via `ssh -t sudo sh -c`
 	Warn  string   // extra warning shown before the prompt
 
+	// Check is a predicate for the step's END STATE, joined with && and run as
+	// the LOGIN USER, not root. Exit 0 means the box is already in the wanted
+	// state.
+	//
+	// It runs twice: before the commands, so a re-run costs nothing and applies
+	// nothing; and after them, so a step whose commands all exited 0 while the
+	// box did not actually change is reported failed instead of silently
+	// counting as done. The second half is the one that matters — the wizard
+	// used to trust exit codes, and a half-applied step looked identical to a
+	// finished one.
+	//
+	// Unprivileged on purpose: a sudo prompt in the middle of a read-only check
+	// is both surprising and unnecessary. Everything worth checking here is
+	// observable without root.
+	Check []string
+
+	// Needs names step IDs that must be satisfied before this one can run. Kept
+	// deliberately sparse: only where a step genuinely cannot work without
+	// another (installing a package needs a fresh apt index). Steps that merely
+	// happen to be related must NOT be chained — an over-connected graph
+	// re-creates the failure this replaces, where declining one step stops
+	// everything downstream.
+	//
+	// An ID that is not in the plan at all counts as satisfied: nothing was
+	// planned, so there is nothing to wait for.
+	Needs []string
+
 	// Confirm, when set, is a word the user must type exactly — a bare "y" is
 	// not enough. Reserved for steps that can sever your own access.
 	Confirm string
@@ -51,6 +78,7 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 				fmt.Sprintf("printf 'fs.inotify.max_user_watches=%d\\n' > /etc/sysctl.d/60-syncthing.conf", want),
 				"sysctl --system >/dev/null",
 			},
+			Check: []string{fmt.Sprintf("[ \"$(cat /proc/sys/fs/inotify/max_user_watches)\" -ge %d ]", want)},
 		})
 	} else {
 		done = append(done, fmt.Sprintf("inotify watches already %d", p.Inotify.MaxUserWatches))
@@ -68,7 +96,7 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 			kind = "spinning disk"
 		}
 		steps = append(steps, Step{
-			ID: "mount",
+			ID: "mount:" + mp,
 			Title: fmt.Sprintf("mount %s (%s %s) at %s",
 				u.Device, HumanBytes(u.SizeBytes), kind, mp),
 			Why: "the drive is plugged in but NOT mounted — a USB disk on a headless box\n" +
@@ -85,6 +113,27 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 				"mount " + mp,
 				"findmnt " + mp,
 			},
+			Check: []string{"findmnt -n " + mp + " >/dev/null"},
+		})
+	}
+
+	// --- a configured but currently unmounted drive --------------------------
+	// Task 1 stopped counting an already-fstabbed partition as a new drive
+	// awaiting adoption (UnmountedDrives), which is right — but skipping it
+	// entirely made it invisible: not in Drives (not mounted), not in
+	// UnmountedDrives (already configured). The wizard then told a user with a
+	// plugged-in, fully configured disk that no external drive was attached at
+	// all. Nothing needs configuring here, only mounting.
+	for _, d := range p.ConfiguredUnmounted() {
+		steps = append(steps, Step{
+			ID:    "mount-configured:" + d.Mountpoint,
+			Title: fmt.Sprintf("mount %s at %s (already in fstab)", d.Device, d.Mountpoint),
+			Why: "the drive has an fstab entry but is NOT mounted right now — it failed to\n" +
+				"    mount this boot, or it was powered off. Nothing needs configuring; it\n" +
+				"    just needs mounting. Until it is, the wizard sees no data drive at all\n" +
+				"    and syncthing folders would land on the boot media",
+			Cmds:  []string{"mount " + d.Mountpoint, "findmnt " + d.Mountpoint},
+			Check: []string{"findmnt -n " + d.Mountpoint + " >/dev/null"},
 		})
 	}
 
@@ -92,7 +141,7 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 	for _, d := range drives {
 		if !p.InFstab(d.UUID) {
 			steps = append(steps, Step{
-				ID:    "fstab",
+				ID:    "fstab:" + d.Mountpoint,
 				Title: fmt.Sprintf("mount %s at %s on boot", d.Device, d.Mountpoint),
 				Why: "the drive has no fstab entry — it does NOT come back after a reboot.\n" +
 					"    nofail + a 10s device timeout mean a missing drive never stalls boot\n" +
@@ -106,6 +155,7 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 					"systemctl daemon-reload",
 					"findmnt " + d.Mountpoint + " >/dev/null || mount " + d.Mountpoint,
 				},
+				Check: []string{fmt.Sprintf("grep -q '%s' /etc/fstab", d.UUID)},
 			})
 		} else {
 			// Check the FSTAB LINE, not the live mount options: nofail and
@@ -132,13 +182,14 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 			// undoing the whole spindown policy until the next reboot.
 			if p.FstabHasOption(d.UUID, "noatime") && !strings.Contains(p.MountOptions(d.Mountpoint), "noatime") {
 				steps = append(steps, Step{
-					ID:    "remount",
+					ID:    "remount:" + d.Mountpoint,
 					Title: fmt.Sprintf("remount %s to pick up noatime", d.Mountpoint),
 					Why: "fstab says noatime but the live mount does not have it — an fstab edit\n" +
 						"    does not apply to an already-mounted filesystem. Until this is\n" +
 						"    remounted, every file READ writes an access timestamp, which keeps\n" +
 						"    waking the disk and undoes the spindown policy",
-					Cmds: []string{"mount -o remount " + d.Mountpoint},
+					Cmds:  []string{"mount -o remount " + d.Mountpoint},
+					Check: []string{fmt.Sprintf("findmnt -no OPTIONS %s | grep -q noatime", d.Mountpoint)},
 				})
 			}
 		}
@@ -174,6 +225,7 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 						"grep -q '^max_usb_current=1' $CFG || printf 'max_usb_current=1\\n' >> $CFG; " +
 						"grep -n max_usb_current $CFG",
 				},
+				Check: []string{"CFG=/boot/firmware/config.txt; [ -f $CFG ] || CFG=/boot/config.txt; grep -q '^max_usb_current=1' $CFG"},
 			})
 		}
 
@@ -199,6 +251,8 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 					// installed is not running
 					"systemctl is-active --quiet hd-idle",
 				},
+				Check: []string{"systemctl is-active --quiet hd-idle"},
+				Needs: []string{"apt-update"},
 			}
 			// A spindown policy on a board that cannot feed the disk is not a
 			// tuning choice, it is a way to destroy the box: every spin-up is a
@@ -267,6 +321,9 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 				"ufw --force enable",
 				"ufw status verbose",
 			},
+			// `ufw status` needs root, so check the observables that do not.
+			Check: []string{"command -v ufw >/dev/null", "systemctl is-active --quiet ufw"},
+			Needs: []string{"apt-update"},
 		})
 	} else {
 		done = append(done, "ufw present ("+p.Security.UFW.Enabled+")")
@@ -303,7 +360,9 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 				"    Debian 12 has no rsyslog and thus no /var/log/auth.log, which fail2ban's\n" +
 				"    sshd jail reads by default — so it installs, enables, and then crashes.\n" +
 				"    Point it at the journal instead",
-			Cmds: append([]string{aptGet("install -y fail2ban")}, f2bCmds...),
+			Cmds:  append([]string{aptGet("install -y fail2ban")}, f2bCmds...),
+			Check: []string{"systemctl is-active --quiet fail2ban", "test -f /etc/fail2ban/jail.local"},
+			Needs: []string{"apt-update"},
 		})
 	case p.Security.Fail2ban.Broken():
 		steps = append(steps, Step{
@@ -313,6 +372,10 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 				"    the missing /var/log/auth.log on Debian 12. Installed is not running:\n" +
 				"    right now this box has no brute-force protection at all",
 			Cmds: f2bCmds,
+			// Same end state as a fresh install, but fail2ban-repair installs
+			// nothing — the package is already there — so it must NOT need
+			// apt-update. TestNeedsIsSparseAndPointsAtRealSteps enforces this.
+			Check: []string{"systemctl is-active --quiet fail2ban", "test -f /etc/fail2ban/jail.local"},
 		})
 	default:
 		done = append(done, "fail2ban present and "+p.Security.Fail2ban.Active)
@@ -328,6 +391,8 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 				"printf 'APT::Periodic::Update-Package-Lists \"1\";\\nAPT::Periodic::Unattended-Upgrade \"1\";\\n' > /etc/apt/apt.conf.d/20auto-upgrades",
 				"systemctl enable --now unattended-upgrades",
 			},
+			Check: []string{"test -f /etc/apt/apt.conf.d/20auto-upgrades", "systemctl is-enabled --quiet unattended-upgrades"},
+			Needs: []string{"apt-update"},
 		})
 	} else {
 		done = append(done, "unattended-upgrades present ("+p.Security.UnattendedUpgrades.Enabled+")")
@@ -343,6 +408,7 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 				Title: "apt-get update",
 				Why:   "package lists must be fresh or the installs below fail on a stale index",
 				Cmds:  []string{aptGet("update")},
+				Check: []string{"find /var/lib/apt/lists -maxdepth 1 -name '*Packages*' -newermt '-1 day' | grep -q ."},
 			}}, steps...)
 			break
 		}

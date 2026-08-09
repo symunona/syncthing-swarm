@@ -7,7 +7,9 @@ import (
 
 func stepByID(steps []Step, id string) *Step {
 	for i := range steps {
-		if steps[i].ID == id {
+		// Per-drive steps are keyed "<kind>:<mountpoint>" so two drives cannot
+		// collide; callers still ask for the kind.
+		if steps[i].ID == id || strings.HasPrefix(steps[i].ID, id+":") {
 			return &steps[i]
 		}
 	}
@@ -602,5 +604,131 @@ func TestFindingsNeverTouchSSHD(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// A step without a Check cannot be verified, cannot be skipped when it is
+// already done, and cannot be re-run safely. There is no such thing as a
+// legitimate check-less step, so assert it structurally rather than trusting
+// review.
+func TestEveryPlannedStepHasACheck(t *testing.T) {
+	for _, fixture := range []string{"rue-pi1b.ndjson", "rue-provisioned.ndjson"} {
+		p := parseFixture(t, fixture)
+		steps, _ := Plan(p, "symunona")
+		for _, s := range steps {
+			if len(s.Check) == 0 {
+				t.Errorf("%s: step %q has no Check", fixture, s.ID)
+			}
+		}
+	}
+}
+
+// Checks run as the login user. A check that shells out to sudo would either
+// prompt for a password in the middle of a read-only verification, or fail
+// outright on a box without passwordless sudo — which is every fresh box.
+func TestChecksDoNotUseSudo(t *testing.T) {
+	p := parseFixture(t, "rue-pi1b.ndjson")
+	steps, _ := Plan(p, "symunona")
+	for _, s := range steps {
+		if strings.Contains(strings.Join(s.Check, " "), "sudo") {
+			t.Errorf("step %q has a Check that needs sudo: %v", s.ID, s.Check)
+		}
+	}
+}
+
+// Anything that installs a package needs the apt index refreshed first, and
+// nothing else needs anything. An over-connected graph would re-create the
+// deadlock this whole change removes.
+func TestNeedsIsSparseAndPointsAtRealSteps(t *testing.T) {
+	p := parseFixture(t, "rue-pi1b.ndjson")
+	steps, _ := Plan(p, "symunona")
+	ids := map[string]bool{}
+	for _, s := range steps {
+		ids[s.ID] = true
+	}
+	for _, s := range steps {
+		installs := strings.Contains(strings.Join(s.Cmds, " "), "install -y")
+		needsApt := false
+		for _, n := range s.Needs {
+			if !ids[n] {
+				t.Errorf("step %q needs %q, which is not in the plan", s.ID, n)
+			}
+			if n == "apt-update" {
+				needsApt = true
+			}
+		}
+		if installs && !needsApt {
+			t.Errorf("step %q installs a package but does not need apt-update", s.ID)
+		}
+		if !installs && len(s.Needs) > 0 {
+			t.Errorf("step %q needs %v but installs nothing — keep Needs sparse", s.ID, s.Needs)
+		}
+	}
+}
+
+// Task 1 stopped treating an already-fstabbed partition as a drive awaiting
+// adoption, which is right — but it must not make the drive vanish. A disk that
+// is plugged in, configured, and simply did not mount this boot is the single
+// most common way one of these boxes breaks, and the wizard used to answer it
+// with "no external drive attached — attach the drive first".
+func TestPlanOffersToMountAConfiguredButUnmountedDrive(t *testing.T) {
+	p := &Probe{
+		Disks: []BlockDevice{{
+			Name: "sdb", Path: "/dev/sdb", Type: "disk", Tran: "usb", Rota: true,
+			Children: []BlockDevice{
+				{Name: "sdb1", Path: "/dev/sdb1", Type: "part", FSType: "ext4", UUID: "aaaa-bbbb"},
+			},
+		}},
+		Fstab: []string{"UUID=aaaa-bbbb\t/srv/data\text4\tdefaults,nofail,noatime\t0\t0"},
+	}
+
+	got := p.ConfiguredUnmounted()
+	if len(got) != 1 || got[0].Mountpoint != "/srv/data" {
+		t.Fatalf("ConfiguredUnmounted() = %+v, want one drive at /srv/data", got)
+	}
+
+	steps, _ := Plan(p, "pi")
+	s := stepByID(steps, "mount-configured")
+	if s == nil {
+		t.Fatal("no mount-configured step for a drive that is in fstab but unmounted")
+	}
+	joined := strings.Join(s.Cmds, " ")
+	if strings.Contains(joined, "/etc/fstab") {
+		t.Errorf("mount-configured must not edit fstab — the entry is already there: %v", s.Cmds)
+	}
+	if !strings.Contains(joined, "mount /srv/data") {
+		t.Errorf("mount-configured does not mount the drive: %v", s.Cmds)
+	}
+}
+
+// A mounted drive is not "configured but unmounted" — it must not produce a
+// second, pointless mount step.
+func TestConfiguredUnmountedIgnoresMountedDrives(t *testing.T) {
+	p := &Probe{
+		Disks: []BlockDevice{{
+			Name: "sdb", Path: "/dev/sdb", Type: "disk", Tran: "usb",
+			Children: []BlockDevice{
+				{Name: "sdb1", Path: "/dev/sdb1", Type: "part", FSType: "ext4",
+					UUID: "aaaa-bbbb", Mountpoint: "/srv/data"},
+			},
+		}},
+		Fstab: []string{"UUID=aaaa-bbbb\t/srv/data\text4\tdefaults\t0\t0"},
+	}
+	if got := p.ConfiguredUnmounted(); len(got) != 0 {
+		t.Errorf("ConfiguredUnmounted() = %+v on a mounted drive", got)
+	}
+}
+
+// Two unmounted drives would otherwise both be called "mount", and the ledger
+// and Needs graph key on ID.
+func TestStepIDsAreUnique(t *testing.T) {
+	p := parseFixture(t, "rue-pi1b.ndjson")
+	steps, _ := Plan(p, "symunona")
+	seen := map[string]bool{}
+	for _, s := range steps {
+		if seen[s.ID] {
+			t.Errorf("duplicate step ID %q", s.ID)
+		}
+		seen[s.ID] = true
 	}
 }

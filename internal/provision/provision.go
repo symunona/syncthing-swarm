@@ -381,6 +381,60 @@ func (p *Probe) UnmountedDrives() []Drive {
 	return out
 }
 
+// ConfiguredUnmounted are partitions that HAVE an fstab entry but are not
+// mounted right now.
+//
+// UnmountedDrives deliberately skips these — an already-configured partition is
+// not a new drive awaiting adoption, and offering to re-add it to fstab would
+// duplicate the line. But skipping it entirely made the drive vanish: not in
+// Drives (not mounted), not in UnmountedDrives (already configured), so the
+// wizard told a user with a plugged-in, fully configured disk that no external
+// drive was attached. A disk that simply failed to mount this boot is the most
+// common way one of these boxes breaks, so name that case and offer the one
+// thing it needs — a mount.
+func (p *Probe) ConfiguredUnmounted() []Drive {
+	var out []Drive
+	for _, disk := range p.Disks {
+		if disk.Type != "disk" {
+			continue
+		}
+		for _, part := range disk.Children {
+			if part.FSType == "" || part.FSType == "swap" || part.Mountpoint != "" {
+				continue
+			}
+			line, ok := p.FstabEntry(part.UUID)
+			if !ok {
+				continue
+			}
+			mp := fstabTarget(line)
+			if mp == "" || osMount(mp) {
+				continue
+			}
+			out = append(out, Drive{
+				Device:     part.Path,
+				Mountpoint: mp,
+				FSType:     part.FSType,
+				UUID:       part.UUID,
+				Label:      part.Label,
+				Rotational: disk.Rota,
+				USB:        disk.Tran == "usb",
+				SizeBytes:  part.Size,
+				Model:      strings.TrimSpace(disk.Model),
+			})
+		}
+	}
+	return out
+}
+
+// fstabTarget pulls the mountpoint (field 2) out of an fstab line.
+func fstabTarget(line string) string {
+	f := strings.Fields(line)
+	if len(f) < 2 {
+		return ""
+	}
+	return f[1]
+}
+
 // SuggestMountpoint guesses where a drive belongs: /mnt/<label> when the
 // filesystem carries one, else /mnt/hdd for a spinning disk, /mnt/ssd for flash.
 func SuggestMountpoint(d Drive) string {
