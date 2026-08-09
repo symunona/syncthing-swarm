@@ -21,19 +21,208 @@ type JoinResult struct {
 	YamlPath   string
 }
 
-// AppendNode adds the new node to swarm.yaml.
-//
-// Appends TEXT rather than round-tripping through yaml.v3, which would eat every
-// comment in the file. swarm.yaml is a hand-maintained cred store; keeping the
-// user's comments matters more than the elegance of the marshaller.
+// AppendNode is a thin compatibility wrapper around the unexported appendNode.
+// The only caller is cmd/stc/bootstrap.go:266, which Task 7 rewires to call
+// UpsertNode directly — this wrapper exists only to keep the build green
+// between this commit and that one, and Task 7 deletes it.
 func AppendNode(path string, n config.Node) error {
+	return appendNode(path, n)
+}
+
+// FieldChange is one scalar that an upsert would rewrite.
+type FieldChange struct{ Field, Old, New string }
+
+// nodeFields is the upsert's whole surface: the scalars bootstrap knows how to
+// derive from a freshly provisioned box. `local` is deliberately absent — it is
+// a human's declaration about which node the dashboard shares FROM, and the
+// wizard has no business guessing it.
+func nodeFields(n config.Node) []FieldChange {
+	return []FieldChange{
+		{Field: "url", New: n.URL},
+		{Field: "apikey", New: n.APIKey},
+		{Field: "root", New: n.Root},
+		{Field: "mount", New: n.Mount},
+		{Field: "ssh", New: n.SSH},
+	}
+}
+
+// DiffNode reports what UpsertNode would change. exists is false when the node
+// is new, in which case changes is nil and the upsert is a plain append.
+func DiffNode(path string, n config.Node) (changes []FieldChange, exists bool, err error) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return nil, false, err
+	}
+	var cur *config.Node
+	for i := range cfg.Nodes {
+		if cfg.Nodes[i].Name == n.Name {
+			cur = &cfg.Nodes[i]
+			break
+		}
+	}
+	if cur == nil {
+		return nil, false, nil
+	}
+	old := map[string]string{
+		"url": cur.URL, "apikey": cur.APIKey, "root": cur.Root,
+		"mount": cur.Mount, "ssh": cur.SSH,
+	}
+	for _, f := range nodeFields(n) {
+		// Never blank a field that swarm.yaml has and this run could not derive.
+		if f.New == "" || f.New == old[f.Field] {
+			continue
+		}
+		f.Old = old[f.Field]
+		changes = append(changes, f)
+	}
+	return changes, true, nil
+}
+
+// UpsertNode writes the node into swarm.yaml: appended when new, rewritten in
+// place when it is already there.
+//
+// Text surgery rather than a yaml.v3 round-trip, for the same reason the
+// original AppendNode appended text: swarm.yaml is a hand-maintained cred store
+// and the marshaller would eat every comment in it.
+//
+// The in-place case exists because a node outlives its hardware. fiona was
+// rebuilt onto a new SSD and came back with a different drive path and a
+// different API key, while its swarm.yaml entry still described the machine it
+// used to be. Refusing to touch an existing entry — the old behaviour — meant
+// the wizard could install syncthing on a box and then be unable to record the
+// result.
+func UpsertNode(path string, n config.Node) error {
+	_, exists, err := DiffNode(path, n)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return appendNode(path, n)
+	}
+
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	if strings.Contains(string(raw), "name: "+n.Name+"\n") ||
-		strings.Contains(string(raw), "name: "+n.Name+" ") {
-		return fmt.Errorf("swarm.yaml already has a node called %q", n.Name)
+	lines := strings.Split(string(raw), "\n")
+
+	start, end := nodeBlock(lines, n.Name)
+	if start < 0 {
+		return fmt.Errorf("node %q parsed from %s but its lines could not be found", n.Name, path)
+	}
+
+	want := map[string]string{}
+	for _, f := range nodeFields(n) {
+		if f.New != "" {
+			want[f.Field] = f.New
+		}
+	}
+
+	for i := start; i < end; i++ {
+		key, _, comment, ok := splitScalar(lines[i])
+		if !ok {
+			continue
+		}
+		v, wanted := want[key]
+		if !wanted {
+			continue
+		}
+		indent := lines[i][:len(lines[i])-len(strings.TrimLeft(lines[i], " "))]
+		lines[i] = fmt.Sprintf("%s%s: %s%s", indent, key, v, comment)
+		delete(want, key)
+	}
+
+	// Fields the old entry never had (a node provisioned before `mount` existed)
+	// get appended to the block rather than dropped.
+	//
+	// Deviation from the brief: naively inserting at `end` breaks on both the
+	// last node in the file (no trailing "- name:" to bound it — `end` lands
+	// after the file's own trailing blank/newline artifact from strings.Split,
+	// so the new field would land outside the node's mapping, after a stray
+	// blank line, and the file's trailing newline would be silently dropped)
+	// and on a middle node (the blank line conventionally separating entries
+	// sits inside [start,end), so the field would land in that gap rather than
+	// beside the fields it belongs with). Walking back from `end` over blank
+	// lines finds the block's real last content line and inserts right after
+	// it, leaving any separator/trailing blank exactly where it was.
+	if len(want) > 0 {
+		insertAt := end
+		for insertAt > start && strings.TrimSpace(lines[insertAt-1]) == "" {
+			insertAt--
+		}
+		var add []string
+		for _, f := range nodeFields(n) {
+			if v, ok := want[f.Field]; ok {
+				add = append(add, fmt.Sprintf("    %s: %s", f.Field, v))
+			}
+		}
+		tail := append([]string{}, lines[insertAt:]...)
+		lines = append(lines[:insertAt], append(add, tail...)...)
+	}
+
+	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600)
+}
+
+// nodeBlock finds the line range of one node's YAML block: from its "- name:"
+// line up to (not including) the next list item at the same indent, or EOF.
+func nodeBlock(lines []string, name string) (start, end int) {
+	start = -1
+	for i, l := range lines {
+		t := strings.TrimSpace(l)
+		if !strings.HasPrefix(t, "- name:") {
+			continue
+		}
+		if start >= 0 {
+			return start, i
+		}
+		// "- name: fiona          # rpi" -> "fiona"
+		v := strings.TrimSpace(strings.TrimPrefix(t, "- name:"))
+		if i := strings.Index(v, "#"); i >= 0 {
+			v = strings.TrimSpace(v[:i])
+		}
+		if v == name {
+			start = i
+		}
+	}
+	if start < 0 {
+		return -1, -1
+	}
+	return start, len(lines)
+}
+
+// splitScalar takes "    apikey: OLD    # note" apart, keeping the trailing
+// comment so a rewrite does not destroy it.
+func splitScalar(line string) (key, value, comment string, ok bool) {
+	t := strings.TrimSpace(line)
+	if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, "- ") {
+		return "", "", "", false
+	}
+	i := strings.Index(t, ":")
+	if i < 0 {
+		return "", "", "", false
+	}
+	key = strings.TrimSpace(t[:i])
+	rest := t[i+1:]
+	if j := strings.Index(rest, "#"); j >= 0 {
+		// keep the original spacing before the comment
+		raw := line[strings.Index(line, "#"):]
+		comment = "    " + raw
+		rest = rest[:j]
+	}
+	return key, strings.TrimSpace(rest), comment, true
+}
+
+// appendNode adds a brand-new node to swarm.yaml. Renamed from the old
+// exported AppendNode: UpsertNode is now the entry point, and it — not this
+// function — decides whether an existing name means "refuse" or "rewrite".
+//
+// Appends TEXT rather than round-tripping through yaml.v3, which would eat every
+// comment in the file. swarm.yaml is a hand-maintained cred store; keeping the
+// user's comments matters more than the elegance of the marshaller.
+func appendNode(path string, n config.Node) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
 	}
 
 	var b strings.Builder
