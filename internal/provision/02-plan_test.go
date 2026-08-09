@@ -719,6 +719,112 @@ func TestConfiguredUnmountedIgnoresMountedDrives(t *testing.T) {
 	}
 }
 
+// apt sets an index file's mtime from the server's Last-Modified header, not
+// from when the download happened, and a 304 Not Modified does not touch the
+// file at all. Debian bookworm's main Packages index is only regenerated at
+// point releases, months apart — so on a real box, EVERY successful
+// `apt-get update` still leaves every index file's mtime older than "-1 day".
+// The old Check (`find … -name '*Packages*' -newermt '-1 day'`) was therefore
+// false after every real update, the step recorded `failed`, and everything
+// with `Needs: apt-update` (hd-idle, ufw, fail2ban, unattended-upgrades) was
+// blocked on every single run. The fix gives apt-update its own stamp file
+// instead of trying to read apt's mind about index mtimes.
+func TestAptUpdateChecksItsOwnStampNotPackageIndexMtime(t *testing.T) {
+	p := parseFixture(t, "rue-pi1b.ndjson")
+	steps, _ := Plan(p, "symunona")
+	au := stepByID(steps, "apt-update")
+	if au == nil {
+		t.Fatal("no apt-update step")
+	}
+	joined := strings.Join(au.Check, " ")
+	if strings.Contains(joined, "Packages") {
+		t.Errorf("apt-update Check still tests package index mtimes, which apt does not "+
+			"reliably update on a successful run: %v", au.Check)
+	}
+	if !strings.Contains(joined, ".stc-update-stamp") {
+		t.Errorf("apt-update Check does not reference its own stamp file: %v", au.Check)
+	}
+	cmds := strings.Join(au.Cmds, " ")
+	if !strings.Contains(cmds, "touch") || !strings.Contains(cmds, ".stc-update-stamp") {
+		t.Errorf("apt-update Cmds never write the stamp the Check looks for: %v", au.Cmds)
+	}
+}
+
+// ufw.service is Type=oneshot + RemainAfterExit=yes: apt's postinst starts it
+// the instant the package is unpacked, entirely independent of whether anyone
+// ever ran `ufw enable`. So Present alone (the old gate) is true on a box with
+// no firewall at all — and the wizard used to call that box DONE, reporting
+// "✓ ufw present (disabled)" while nothing was blocking a single connection.
+func TestPlanInstalledButDisabledUFWStillProducesTheStep(t *testing.T) {
+	p := parseFixture(t, "rue-pi1b.ndjson")
+	// installed, and the oneshot unit is "active" (its postinst ran it once),
+	// but `ufw enable` itself was never run — the actual firewall is off.
+	p.Security.UFW = Tool{Present: true, Enabled: "disabled", Active: "active"}
+
+	steps, done := Plan(p, "symunona")
+	ufw := stepByID(steps, "ufw")
+	if ufw == nil {
+		t.Fatal("an installed-but-disabled ufw produced no step — a box with no firewall " +
+			"would be reported as finished")
+	}
+	if strings.Contains(strings.Join(done, " "), "ufw present") {
+		t.Error("an installed-but-disabled ufw was reported under `done`")
+	}
+	// And the Check itself must read the real flag, not systemd's oneshot state.
+	joined := strings.Join(ufw.Check, " ")
+	if strings.Contains(joined, "is-active") {
+		t.Error("ufw Check still tests is-active, which the oneshot unit satisfies " +
+			"whether or not `ufw enable` ever ran")
+	}
+	if !strings.Contains(joined, "ufw.conf") || !strings.Contains(joined, "ENABLED=yes") {
+		t.Errorf("ufw Check does not read /etc/ufw/ufw.conf's real ENABLED flag: %v", ufw.Check)
+	}
+}
+
+// is-active alone is satisfied by hd-idle watching the WRONG disk — a stale
+// /etc/default/hd-idle left behind by a drive that has since been replaced,
+// or a restart that raced a leftover process. The Check must also confirm
+// the config it wrote is the one actually in effect, the same way the
+// syncthing-service Check inspects /proc/<pid>/cmdline instead of trusting
+// is-active alone.
+func TestHdIdleCheckVerifiesTheConfiguredDiskNotJustIsActive(t *testing.T) {
+	p := parseFixture(t, "rue-pi1b.ndjson")
+	steps, _ := Plan(p, "symunona")
+	hd := stepByID(steps, "hd-idle")
+	if hd == nil {
+		t.Fatal("no hd-idle step")
+	}
+	joined := strings.Join(hd.Check, " ")
+	if !strings.Contains(joined, "is-active") {
+		t.Error("hd-idle Check dropped the is-active test")
+	}
+	if !strings.Contains(joined, "/etc/default/hd-idle") || !strings.Contains(joined, "-a /dev/sda") {
+		t.Errorf("hd-idle Check does not verify the -a <disk> it wrote to /etc/default/hd-idle: %v", hd.Check)
+	}
+}
+
+// The step runs `systemctl enable --now unattended-upgrades`, whose end state
+// is enabled AND running. `is-enabled --quiet` alone also exits 0 for a unit
+// in "static" state — which `--now` never promises — and says nothing about
+// whether the service actually started. The Check must confirm both halves
+// of what the command actually did.
+func TestUnattendedUpgradesCheckVerifiesActiveNotJustEnabled(t *testing.T) {
+	p := parseFixture(t, "rue-pi1b.ndjson")
+	steps, _ := Plan(p, "symunona")
+	uu := stepByID(steps, "unattended-upgrades")
+	if uu == nil {
+		t.Fatal("no unattended-upgrades step")
+	}
+	joined := strings.Join(uu.Check, " ")
+	if !strings.Contains(joined, "is-enabled") {
+		t.Error("unattended-upgrades Check dropped the is-enabled test")
+	}
+	if !strings.Contains(joined, "is-active") {
+		t.Error("unattended-upgrades Check does not verify is-active, only is-enabled — " +
+			"the step runs `enable --now`, whose end state includes actually RUNNING")
+	}
+}
+
 // Two unmounted drives would otherwise both be called "mount", and the ledger
 // and Needs graph key on ID.
 func TestStepIDsAreUnique(t *testing.T) {

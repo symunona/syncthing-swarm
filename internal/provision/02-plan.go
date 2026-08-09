@@ -251,7 +251,16 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 					// installed is not running
 					"systemctl is-active --quiet hd-idle",
 				},
-				Check: []string{"systemctl is-active --quiet hd-idle"},
+				// is-active alone is satisfied by a hd-idle watching the WRONG
+				// disk — a stale /etc/default/hd-idle left from a drive that
+				// has since been replaced, or a restart that raced a previous
+				// instance. Mirror what the syncthing service Check does with
+				// /proc/<pid>/cmdline: verify the config we actually wrote is
+				// the one in effect, not just that some hd-idle is running.
+				Check: []string{
+					"systemctl is-active --quiet hd-idle",
+					fmt.Sprintf("grep -q -- '-a %s' /etc/default/hd-idle", disk),
+				},
 				Needs: []string{"apt-update"},
 			}
 			// A spindown policy on a board that cannot feed the disk is not a
@@ -288,7 +297,17 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 
 	// --- security ------------------------------------------------------------
 	// Additive and reversible only. Nothing here edits sshd_config.
-	if !p.Security.UFW.Present {
+	// Key on the ENABLED state, not Present. ufw.service is Type=oneshot +
+	// RemainAfterExit=yes, and apt's postinst starts it the moment the package
+	// lands — entirely independent of whether anyone ever ran `ufw enable`. So
+	// an installed-but-never-enabled ufw has Present=true while the box has no
+	// firewall at all: `ufw enable` is what flips ENABLED=yes in
+	// /etc/ufw/ufw.conf (and, with it, the systemd enablement this wizard
+	// already probes into p.Security.UFW.Enabled). Gating on Present alone
+	// meant no step was ever planned for that box, and it was reported under
+	// `done` as "✓ ufw present (disabled)" — a box with no firewall, called
+	// finished.
+	if !p.Security.UFW.Present || p.Security.UFW.Enabled != "enabled" {
 		port := p.Security.SSHDPort
 		steps = append(steps, Step{
 			ID:    "ufw",
@@ -322,7 +341,13 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 				"ufw status verbose",
 			},
 			// `ufw status` needs root, so check the observables that do not.
-			Check: []string{"command -v ufw >/dev/null", "systemctl is-active --quiet ufw"},
+			// NOT `systemctl is-active --quiet ufw`: that unit is Type=oneshot +
+			// RemainAfterExit=yes and goes active the instant apt's postinst
+			// starts it, whether or not `ufw enable` was ever run — so a box
+			// with is-active=active can still have ENABLED=no in
+			// /etc/ufw/ufw.conf and let everything through. That file is 0644,
+			// so reading the real flag stays unprivileged.
+			Check: []string{"command -v ufw >/dev/null", "grep -q '^ENABLED=yes' /etc/ufw/ufw.conf"},
 			Needs: []string{"apt-update"},
 		})
 	} else {
@@ -391,7 +416,18 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 				"printf 'APT::Periodic::Update-Package-Lists \"1\";\\nAPT::Periodic::Unattended-Upgrade \"1\";\\n' > /etc/apt/apt.conf.d/20auto-upgrades",
 				"systemctl enable --now unattended-upgrades",
 			},
-			Check: []string{"test -f /etc/apt/apt.conf.d/20auto-upgrades", "systemctl is-enabled --quiet unattended-upgrades"},
+			// The step runs `enable --now`, whose end state is BOTH enabled and
+			// running. Checking only is-enabled misses that: `is-enabled
+			// --quiet` also exits 0 for a unit in "static" state, which is not
+			// what `--now` promises, and either way a unit can be enabled
+			// without ever having started (a prior `enable` with no `--now`,
+			// or a start that failed silently). is-active pins the half the
+			// old Check let slip through.
+			Check: []string{
+				"test -f /etc/apt/apt.conf.d/20auto-upgrades",
+				"systemctl is-enabled --quiet unattended-upgrades",
+				"systemctl is-active --quiet unattended-upgrades",
+			},
 			Needs: []string{"apt-update"},
 		})
 	} else {
@@ -407,8 +443,23 @@ func Plan(p *Probe, user string) (steps []Step, done []string) {
 				ID:    "apt-update",
 				Title: "apt-get update",
 				Why:   "package lists must be fresh or the installs below fail on a stale index",
-				Cmds:  []string{aptGet("update")},
-				Check: []string{"find /var/lib/apt/lists -maxdepth 1 -name '*Packages*' -newermt '-1 day' | grep -q ."},
+				Cmds:  []string{aptGet("update"), "touch /var/lib/apt/lists/.stc-update-stamp"},
+				// NOT "did an index file's mtime change in the last day": apt sets
+				// each index's mtime from the server's Last-Modified header, not
+				// from when WE downloaded it, and on a 304 Not Modified it does not
+				// touch the file at all. Debian bookworm's main Packages index is
+				// only regenerated at point releases, months apart — so on a real
+				// box `apt-get update` runs clean, every index comes back 304 or
+				// with a months-old Last-Modified, and `-newermt '-1 day'` is false
+				// for every file. The step then recorded `failed` even though the
+				// update worked, which blocked hd-idle/ufw/fail2ban/
+				// unattended-upgrades (all of them Needs: apt-update) on every
+				// single run. apt-get update has no other observable end state —
+				// no version number, no file it always rewrites — so give the step
+				// its own stamp instead of trying to read apt's mind about the
+				// index files. /var/lib/apt/lists is 0755, so the stamp is
+				// readable by the unprivileged Check.
+				Check: []string{"find /var/lib/apt/lists/.stc-update-stamp -newermt '-1 day' 2>/dev/null | grep -q ."},
 			}}, steps...)
 			break
 		}
