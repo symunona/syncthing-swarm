@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/symunona/syncthing-dashboard/internal/config"
@@ -160,7 +161,40 @@ func UpsertNode(path string, n config.Node) error {
 		lines = append(lines[:insertAt], append(add, tail...)...)
 	}
 
-	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600)
+	return atomicWriteFile(path, []byte(strings.Join(lines, "\n")), 0o600)
+}
+
+// atomicWriteFile replaces path's contents without ever leaving it half
+// written. swarm.yaml is a credential store with no backup copy the user can
+// reconstruct; an interrupt (crash, killed process, disk full) partway
+// through an in-place os.WriteFile would truncate it to zero length before a
+// single new byte lands. Writing to a temp file in the same directory first
+// and renaming over the target makes the switch a single filesystem
+// operation: readers either see the old file or the new one, never a
+// half-written one. Same directory matters — os.Rename is only atomic within
+// one filesystem/mount, and a cross-filesystem tmp dir would fall back to a
+// non-atomic copy.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".swarm-yaml-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // no-op once the rename below succeeds
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	// os.CreateTemp makes the file 0600 already, but this store holds live
+	// API keys, so the mode is asserted explicitly rather than trusted.
+	if err := os.Chmod(tmpPath, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 // nodeBlock finds the line range of one node's YAML block: from its "- name:"
@@ -192,6 +226,14 @@ func nodeBlock(lines []string, name string) (start, end int) {
 
 // splitScalar takes "    apikey: OLD    # note" apart, keeping the trailing
 // comment so a rewrite does not destroy it.
+//
+// A '#' only starts a YAML comment when it is preceded by whitespace (or
+// opens the line) — never when it's stuck to the middle of a scalar. Treating
+// every '#' as a comment marker would silently truncate a credential like
+// "ABC#DEF" down to "ABC" on the next rewrite, and worse, could leave a
+// fragment of a REPLACED secret sitting in the file disguised as a comment.
+// So the value and comment are only ever split on a '#' that is genuinely
+// preceded by a space or tab.
 func splitScalar(line string) (key, value, comment string, ok bool) {
 	t := strings.TrimSpace(line)
 	if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, "- ") {
@@ -202,12 +244,33 @@ func splitScalar(line string) (key, value, comment string, ok bool) {
 		return "", "", "", false
 	}
 	key = strings.TrimSpace(t[:i])
-	rest := t[i+1:]
-	if j := strings.Index(rest, "#"); j >= 0 {
-		// keep the original spacing before the comment
-		raw := line[strings.Index(line, "#"):]
-		comment = "    " + raw
-		rest = rest[:j]
+
+	// Work from the raw, untrimmed line past the colon: whatever spacing the
+	// user typed between the value and the comment is theirs to keep, since
+	// swarm.yaml is hand-formatted and those comments are hand-aligned.
+	leadWS := len(line) - len(strings.TrimLeft(line, " \t"))
+	rest := line[leadWS+i+1:]
+
+	commentAt := -1
+	for idx := 0; idx < len(rest); idx++ {
+		if rest[idx] != '#' {
+			continue
+		}
+		if idx == 0 || rest[idx-1] == ' ' || rest[idx-1] == '\t' {
+			commentAt = idx
+			break
+		}
+	}
+	if commentAt >= 0 {
+		// Walk back over the whitespace run right before the '#' too, so the
+		// comment carries its own lead-in spacing rather than losing it to
+		// the trimmed value.
+		start := commentAt
+		for start > 0 && (rest[start-1] == ' ' || rest[start-1] == '\t') {
+			start--
+		}
+		comment = rest[start:]
+		rest = rest[:start]
 	}
 	return key, strings.TrimSpace(rest), comment, true
 }
