@@ -162,12 +162,19 @@ git commit -m "probe: SD card is not an unmounted data drive"
 
 **Files:**
 - Modify: `internal/provision/02-plan.go:9-20` (`Step`), and every `Step{...}` literal in `Plan`
+- Modify: `internal/provision/provision.go` (new `ConfiguredUnmounted` helper, beside `UnmountedDrives`)
 - Modify: `internal/provision/02-plan_test.go:8-15` (`stepByID` helper)
 - Test: `internal/provision/02-plan_test.go` (append)
 
 **Interfaces:**
 - Consumes: Task 1's narrowed `UnmountedDrives`.
 - Produces:
+  - `func (p *Probe) ConfiguredUnmounted() []Drive` — partitions that have an fstab
+    entry but are not mounted right now, with `Mountpoint` filled from the fstab
+    line. Task 1 removed these from `UnmountedDrives`; without this helper a drive
+    that failed to mount this boot is invisible to the wizard, which then reports
+    "no external drive attached" for a disk that is plugged in and configured.
+  - A `mount-configured:<mountpoint>` step for each of them.
   - `Step.Check []string` — predicate commands, joined with `&&`, run unprivileged; exit 0 means "already satisfied".
   - `Step.Needs []string` — step IDs that must be satisfied first.
   - Step IDs that can occur more than once per plan become `"<kind>:<mountpoint>"` (`mount:/mnt/data`, `fstab:/srv/data`, `remount:/srv/data`). Single-occurrence IDs (`apt-update`, `inotify`, `ufw`, `fail2ban`, `fail2ban-repair`, `unattended-upgrades`, `usb-power`, `hd-idle`) are unchanged.
@@ -281,6 +288,59 @@ func TestNeedsIsSparseAndPointsAtRealSteps(t *testing.T) {
 	}
 }
 
+// Task 1 stopped treating an already-fstabbed partition as a drive awaiting
+// adoption, which is right — but it must not make the drive vanish. A disk that
+// is plugged in, configured, and simply did not mount this boot is the single
+// most common way one of these boxes breaks, and the wizard used to answer it
+// with "no external drive attached — attach the drive first".
+func TestPlanOffersToMountAConfiguredButUnmountedDrive(t *testing.T) {
+	p := &Probe{
+		Disks: []BlockDevice{{
+			Name: "sdb", Path: "/dev/sdb", Type: "disk", Tran: "usb", Rota: true,
+			Children: []BlockDevice{
+				{Name: "sdb1", Path: "/dev/sdb1", Type: "part", FSType: "ext4", UUID: "aaaa-bbbb"},
+			},
+		}},
+		Fstab: []string{"UUID=aaaa-bbbb\t/srv/data\text4\tdefaults,nofail,noatime\t0\t0"},
+	}
+
+	got := p.ConfiguredUnmounted()
+	if len(got) != 1 || got[0].Mountpoint != "/srv/data" {
+		t.Fatalf("ConfiguredUnmounted() = %+v, want one drive at /srv/data", got)
+	}
+
+	steps, _ := Plan(p, "pi")
+	s := stepByID(steps, "mount-configured")
+	if s == nil {
+		t.Fatal("no mount-configured step for a drive that is in fstab but unmounted")
+	}
+	joined := strings.Join(s.Cmds, " ")
+	if strings.Contains(joined, "/etc/fstab") {
+		t.Errorf("mount-configured must not edit fstab — the entry is already there: %v", s.Cmds)
+	}
+	if !strings.Contains(joined, "mount /srv/data") {
+		t.Errorf("mount-configured does not mount the drive: %v", s.Cmds)
+	}
+}
+
+// A mounted drive is not "configured but unmounted" — it must not produce a
+// second, pointless mount step.
+func TestConfiguredUnmountedIgnoresMountedDrives(t *testing.T) {
+	p := &Probe{
+		Disks: []BlockDevice{{
+			Name: "sdb", Path: "/dev/sdb", Type: "disk", Tran: "usb",
+			Children: []BlockDevice{
+				{Name: "sdb1", Path: "/dev/sdb1", Type: "part", FSType: "ext4",
+					UUID: "aaaa-bbbb", Mountpoint: "/srv/data"},
+			},
+		}},
+		Fstab: []string{"UUID=aaaa-bbbb\t/srv/data\text4\tdefaults\t0\t0"},
+	}
+	if got := p.ConfiguredUnmounted(); len(got) != 0 {
+		t.Errorf("ConfiguredUnmounted() = %+v on a mounted drive", got)
+	}
+}
+
 // Two unmounted drives would otherwise both be called "mount", and the ledger
 // and Needs graph key on ID.
 func TestStepIDsAreUnique(t *testing.T) {
@@ -333,6 +393,20 @@ Check: []string{fmt.Sprintf("[ \"$(cat /proc/sys/fs/inotify/max_user_watches)\" 
 ID:    "mount:" + mp,
 Check: []string{"findmnt -n " + mp + " >/dev/null"},
 
+// configured but unmounted — a NEW step, emitted for each
+// p.ConfiguredUnmounted(). It edits nothing: the fstab entry already exists,
+// so all that is missing is the mount itself.
+Step{
+	ID:    "mount-configured:" + d.Mountpoint,
+	Title: fmt.Sprintf("mount %s at %s (already in fstab)", d.Device, d.Mountpoint),
+	Why: "the drive has an fstab entry but is NOT mounted right now — it failed to\n" +
+		"    mount this boot, or it was powered off. Nothing needs configuring; it\n" +
+		"    just needs mounting. Until it is, the wizard sees no data drive at all\n" +
+		"    and syncthing folders would land on the boot media",
+	Cmds:  []string{"mount " + d.Mountpoint, "findmnt " + d.Mountpoint},
+	Check: []string{"findmnt -n " + d.Mountpoint + " >/dev/null"},
+},
+
 // fstab (ID becomes "fstab:"+d.Mountpoint)
 ID:    "fstab:" + d.Mountpoint,
 Check: []string{fmt.Sprintf("grep -q '%s' /etc/fstab", d.UUID)},
@@ -367,6 +441,68 @@ Needs: []string{"apt-update"},
 // apt-update
 Check: []string{"find /var/lib/apt/lists -maxdepth 1 -name '*Packages*' -newermt '-1 day' | grep -q ."},
 ```
+
+And add the helper to `internal/provision/provision.go`, directly below
+`UnmountedDrives` so the pair reads together:
+
+```go
+// ConfiguredUnmounted are partitions that HAVE an fstab entry but are not
+// mounted right now.
+//
+// UnmountedDrives deliberately skips these — an already-configured partition is
+// not a new drive awaiting adoption, and offering to re-add it to fstab would
+// duplicate the line. But skipping it entirely made the drive vanish: not in
+// Drives (not mounted), not in UnmountedDrives (already configured), so the
+// wizard told a user with a plugged-in, fully configured disk that no external
+// drive was attached. A disk that simply failed to mount this boot is the most
+// common way one of these boxes breaks, so name that case and offer the one
+// thing it needs — a mount.
+func (p *Probe) ConfiguredUnmounted() []Drive {
+	var out []Drive
+	for _, disk := range p.Disks {
+		if disk.Type != "disk" {
+			continue
+		}
+		for _, part := range disk.Children {
+			if part.FSType == "" || part.FSType == "swap" || part.Mountpoint != "" {
+				continue
+			}
+			line, ok := p.FstabEntry(part.UUID)
+			if !ok {
+				continue
+			}
+			mp := fstabTarget(line)
+			if mp == "" || osMount(mp) {
+				continue
+			}
+			out = append(out, Drive{
+				Device:     part.Path,
+				Mountpoint: mp,
+				FSType:     part.FSType,
+				UUID:       part.UUID,
+				Label:      part.Label,
+				Rotational: disk.Rota,
+				USB:        disk.Tran == "usb",
+				SizeBytes:  part.Size,
+				Model:      strings.TrimSpace(disk.Model),
+			})
+		}
+	}
+	return out
+}
+
+// fstabTarget pulls the mountpoint (field 2) out of an fstab line.
+func fstabTarget(line string) string {
+	f := strings.Fields(line)
+	if len(f) < 2 {
+		return ""
+	}
+	return f[1]
+}
+```
+
+Emit the step by looping over `p.ConfiguredUnmounted()` in `Plan`, immediately
+after the existing `p.UnmountedDrives()` loop.
 
 - [ ] **Step 5: Run the tests**
 
