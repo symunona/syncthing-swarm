@@ -262,6 +262,94 @@ func TestUpsertNodeAppendsMissingFieldOnMiddleNode(t *testing.T) {
 	}
 }
 
+// A node whose fields are indented differently from the rest of the file —
+// six spaces here instead of the usual four, the kind of drift a hand edit
+// introduces — must still get an appended field at ITS OWN depth, not a
+// hardcoded four spaces. The old hardcoded "    %s: %s" would have landed
+// "mount" two columns shallower than every other field in echo's block,
+// which yaml.v3 tolerates as a sibling key only by accident of indentation
+// rules; a file that indented deeper still (or used tabs) would not be so
+// lucky.
+const differentIndentFixture = `listen: :8888
+pollSeconds: 10
+nodes:
+    - name: echo
+      url: http://10.0.0.5:8384
+      apikey: DDD
+`
+
+func TestUpsertNodeAppendsMissingFieldAtTheBlocksOwnIndent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "swarm.yaml")
+	if err := os.WriteFile(path, []byte(differentIndentFixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpsertNode(path, config.Node{Name: "echo", Mount: "/mnt/echo"}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+
+	if !strings.Contains(s, "apikey: DDD\n      mount: /mnt/echo\n") {
+		t.Errorf("appended field did not match the block's own 6-space indent:\n%s", s)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("file no longer parses after appending at the block's own indent: %v\n%s", err, s)
+	}
+	if got := cfg.Node("echo"); got == nil || got.Mount != "/mnt/echo" {
+		t.Errorf("echo.Mount = %+v, want /mnt/echo", got)
+	}
+}
+
+// YAML lets a scalar be quoted or bare: `- name: fiona` and
+// `- name: "fiona"` name the same node. nodeBlock used to compare the raw
+// text, so a quoted name never matched at all — DiffNode (which goes through
+// config.Load/yaml.v3, and DOES unquote) would find the node and report it
+// existing, and then UpsertNode's own nodeBlock scan would fail to find its
+// lines and return an error, after syncthing was already installed and
+// running on the box.
+const quotedNameFixture = `listen: :8888
+pollSeconds: 10
+nodes:
+  - name: "fiona"
+    url: http://100.86.131.51:8384
+    apikey: OLDKEY
+`
+
+func TestUpsertNodeMatchesAQuotedName(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "swarm.yaml")
+	if err := os.WriteFile(path, []byte(quotedNameFixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := UpsertNode(path, config.Node{
+		Name: "fiona", URL: "http://100.86.131.51:8384", APIKey: "NEWKEY",
+	})
+	if err != nil {
+		t.Fatalf("UpsertNode failed to find a quoted node name: %v", err)
+	}
+	out, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if strings.Contains(s, "OLDKEY") {
+		t.Error("stale apikey survived — the quoted node was not matched, so this landed as an append, not a rewrite")
+	}
+	if !strings.Contains(s, "apikey: NEWKEY") {
+		t.Error("new apikey not written")
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("file no longer parses: %v\n%s", err, s)
+	}
+	if len(cfg.Nodes) != 1 {
+		t.Errorf("expected exactly 1 node (rewrite, not append), got %d: %+v", len(cfg.Nodes), cfg.Nodes)
+	}
+}
+
 // YAML only starts a comment at a '#' preceded by whitespace (or at the very
 // start of the line) — never at a bare '#' stuck inside a scalar. delta's
 // apikey below has one glued to the middle of it, the way a hex/base64 API

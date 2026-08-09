@@ -143,10 +143,27 @@ func UpsertNode(path string, n config.Node) error {
 		for insertAt > start && strings.TrimSpace(lines[insertAt-1]) == "" {
 			insertAt--
 		}
+		// Derive the indent from an existing FIELD line in this node's block —
+		// the same way the rewrite loop above derives it — instead of
+		// hardcoding "    ". A hardcoded four spaces silently corrupts any
+		// swarm.yaml that happens to indent its fields differently (hand
+		// edits are exactly how this file drifts): the appended field lands
+		// at the wrong depth, which is either a cosmetic wart if YAML still
+		// parses it as a sibling, or a flat-out parse error if it doesn't.
+		// splitScalar rejects the "- name:" line itself (it starts with
+		// "- "), so this walk naturally lands on the first real field —
+		// url, apikey, whichever the block actually has.
+		indent := "    "
+		for i := start; i < end; i++ {
+			if key, _, _, ok := splitScalar(lines[i]); ok && key != "" {
+				indent = lines[i][:len(lines[i])-len(strings.TrimLeft(lines[i], " "))]
+				break
+			}
+		}
 		var add []string
 		for _, f := range nodeFields(n) {
 			if v, ok := want[f.Field]; ok {
-				add = append(add, fmt.Sprintf("    %s: %s", f.Field, v))
+				add = append(add, fmt.Sprintf("%s%s: %s", indent, f.Field, v))
 			}
 		}
 		tail := append([]string{}, lines[insertAt:]...)
@@ -178,6 +195,18 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		tmp.Close()
 		return err
 	}
+	// Flush to disk before the rename. Without this, the write can still be
+	// sitting in the page cache when the rename lands: the DIRECTORY ENTRY
+	// swap is durable immediately, but the file's actual bytes are not
+	// guaranteed to be until fsync'd, and a power loss or crash between the
+	// rename and the eventual writeback can leave the new name pointing at
+	// zero or partial bytes on some filesystems/mount options — the exact
+	// half-written state this function exists to prevent, just moved one
+	// step later.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
@@ -206,6 +235,15 @@ func nodeBlock(lines []string, name string) (start, end int) {
 		if i := strings.Index(v, "#"); i >= 0 {
 			v = strings.TrimSpace(v[:i])
 		}
+		// YAML lets a scalar be quoted or bare — "- name: fiona" and
+		// "- name: \"fiona\"" name the same node. Comparing the raw text
+		// meant a quoted entry never matched `name` at all: nodeBlock
+		// returned start=-1, UpsertNode's "its lines could not be found"
+		// error fired on a node DiffNode had just found two lines above it
+		// (DiffNode goes through config.Load/yaml.v3, which does unquote),
+		// and the failure landed after syncthing was already installed and
+		// running on the box — installed, but never recorded.
+		v = strings.Trim(v, `"'`)
 		if v == name {
 			start = i
 		}
@@ -274,6 +312,15 @@ func splitScalar(line string) (key, value, comment string, ok bool) {
 // Appends TEXT rather than round-tripping through yaml.v3, which would eat every
 // comment in the file. swarm.yaml is a hand-maintained cred store; keeping the
 // user's comments matters more than the elegance of the marshaller.
+//
+// This is the path a brand-new node takes — the FIRST time bootstrap ever
+// writes a box's credentials to swarm.yaml — so it gets the same atomic-write
+// guarantee as the rewrite path below, not a plain O_APPEND. An append that
+// dies partway (disk full, process killed, ssh session dropped mid-write) can
+// leave a truncated "- name: rue\n    url: http://…" fragment sitting in the
+// file, which is a YAML parse error the NEXT time anything reads swarm.yaml —
+// including every other, already-working node's credentials sitting right
+// above it.
 func appendNode(path string, n config.Node) error {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -299,13 +346,7 @@ func appendNode(path string, n config.Node) error {
 		fmt.Fprintf(&b, "    ssh: %s\n", n.SSH)
 	}
 
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = f.WriteString(b.String())
-	return err
+	return atomicWriteFile(path, append(raw, b.String()...), 0o600)
 }
 
 // MeshDevice teaches every node in the swarm about the new device, and the new
