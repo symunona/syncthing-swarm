@@ -29,6 +29,8 @@ func main() {
 		cmdShare(os.Args[2:])
 	case "unshare":
 		cmdUnshare(os.Args[2:])
+	case "remesh":
+		cmdRemesh(os.Args[2:])
 	case "bootstrap":
 		cmdBootstrap(os.Args[2:])
 	case "adopt":
@@ -49,10 +51,11 @@ func usage() {
 	fmt.Fprint(os.Stderr, `stc — syncthing-swarm folder sharing
 
 usage:
-  stc share     <folder> <target> [-path DIR] [-from NODE] [-config FILE]
-  stc unshare   <folder> <target>            [-from NODE] [-config FILE]
-  stc bootstrap <ssh-dest>                   [-no-bench]  [-config FILE]
-  stc list      devices                                   [-config FILE]
+  stc share     <folder> <target> [-path DIR] [-from NODE] [-pairwise] [-config FILE]
+  stc unshare   <folder> <target>            [-from NODE]             [-config FILE]
+  stc remesh    <folder> | -all                                       [-config FILE]
+  stc bootstrap <ssh-dest>                   [-no-bench]              [-config FILE]
+  stc list      devices                                               [-config FILE]
   stc device    list | add <id> [name] | remove <id>      [-on N|-all] [-config FILE]
 
   <folder>    folder id or label (looked up on the source node)
@@ -60,10 +63,17 @@ usage:
   <ssh-dest>  ssh destination of a new node, e.g. rue (uses your ~/.ssh/config)
   -from       source node (default: the local/127.0.0.1 node in swarm.yaml)
   -path       target dir for the new folder (default: <target root>/<label>)
+  -pairwise   share only does this end move: same 2-device topology as before
+              mesh existed. Default is mesh: every node that already holds
+              this folder gets widened to the same device set.
   -no-bench   bootstrap: skip the sha256 benchmark (loses the initial-scan ETA)
   -config     swarm.yaml path (default: swarm.yaml)
 
 unshare never deletes files on disk. No confirmation prompt.
+remesh only WIDENS a folder's device list on nodes that already have it — it
+never shares the folder anywhere new. Use it to fix folders shared with
+-pairwise (or shared before mesh-by-default existed). -all sweeps every
+folder found anywhere in the swarm.
 bootstrap surveys the box read-only first and changes nothing without a prompt.
 `)
 	os.Exit(2)
@@ -74,13 +84,14 @@ func cmdShare(args []string) {
 	cfgPath := fs.String("config", "swarm.yaml", "swarm.yaml path")
 	from := fs.String("from", "", "source node")
 	path := fs.String("path", "", "target dir override")
+	pairwise := fs.Bool("pairwise", false, "share only source<->target; skip meshing other nodes that already hold this folder")
 	fs.Parse(args)
 	folder, target := two(fs, "share")
 
 	cfg := load(*cfgPath)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
-	res, err := sharing.Share(ctx, cfg, folder, *from, target, *path)
+	res, err := sharing.Share(ctx, cfg, folder, *from, target, *path, *pairwise)
 	die(err)
 	fmt.Printf("shared %q: %s -> %s at %s\n", res.Folder, res.Source, res.Target, res.TargetPath)
 	if res.Note != "" {

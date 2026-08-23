@@ -64,6 +64,11 @@ share folder target:
 unshare folder target:
     go run ./cmd/stc unshare {{folder}} {{target}} -config {{config}}
 
+# repair a folder shared before mesh-by-default (or with -pairwise): just remesh <folder>
+# widens device membership only on nodes that already have it — never shares it anywhere new.
+remesh folder:
+    go run ./cmd/stc remesh {{folder}} -config {{config}}
+
 # build everything and (re)start the local dashboard on :8888 in tmux `stdash`.
 # run this at the end of a task so :8888 always matches the code.
 deploy: build

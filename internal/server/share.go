@@ -37,7 +37,9 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
-	res, err := sharing.Share(ctx, s.cfg, req.Folder, req.Source, req.Target, req.Path)
+	// mesh by default here too (pairwise=false) — the dashboard's one-click
+	// share should not leave a folder any more pairwise than `stc share` does.
+	res, err := sharing.Share(ctx, s.cfg, req.Folder, req.Source, req.Target, req.Path, false)
 	if err != nil {
 		s.writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return

@@ -31,7 +31,14 @@ type Result struct {
 
 // Share shares folderID (given by id OR label, resolved on the source) from the
 // source node to the target node. pathOverride wins over the target's root dir.
-func Share(ctx context.Context, cfg *config.Config, folderRef, sourceName, targetName, pathOverride string) (*Result, error) {
+//
+// pairwise=false (the default from `stc share`) additionally meshes every
+// other node in swarm.yaml that already holds this folder onto the same
+// device set as source and target, so the folder never regresses to a
+// laptop-hub topology just because it was shared one pair at a time — see
+// mesh.go's incident comment. pairwise=true keeps the old two-device-only
+// behavior for a share that is deliberately meant to stay that way.
+func Share(ctx context.Context, cfg *config.Config, folderRef, sourceName, targetName, pathOverride string, pairwise bool) (*Result, error) {
 	src, tgt, err := endpoints(cfg, sourceName, targetName)
 	if err != nil {
 		return nil, err
@@ -96,24 +103,40 @@ func Share(ctx context.Context, cfg *config.Config, folderRef, sourceName, targe
 				return nil, fmt.Errorf("update folder on %q: %w", tgt.Name, err)
 			}
 		}
-		return res, nil
+	} else {
+		ftype, _ := srcFolder["type"].(string)
+		if ftype == "" {
+			ftype = "sendreceive"
+		}
+		newFolder := stclient.Folder{
+			"id":    id,
+			"label": label,
+			"path":  targetPath,
+			"type":  ftype,
+			"devices": []any{
+				map[string]any{"deviceID": srcID.MyID},
+				map[string]any{"deviceID": tgtID.MyID},
+			},
+		}
+		if err := tgtCli.PutFolder(ctx, newFolder); err != nil {
+			return nil, fmt.Errorf("create folder on %q: %w", tgt.Name, err)
+		}
 	}
-	ftype, _ := srcFolder["type"].(string)
-	if ftype == "" {
-		ftype = "sendreceive"
-	}
-	newFolder := stclient.Folder{
-		"id":    id,
-		"label": label,
-		"path":  targetPath,
-		"type":  ftype,
-		"devices": []any{
-			map[string]any{"deviceID": srcID.MyID},
-			map[string]any{"deviceID": tgtID.MyID},
-		},
-	}
-	if err := tgtCli.PutFolder(ctx, newFolder); err != nil {
-		return nil, fmt.Errorf("create folder on %q: %w", tgt.Name, err)
+
+	// 3) mesh: widen every OTHER node that already holds this folder onto the
+	// same device set src and tgt now share, instead of leaving them stuck
+	// pairwise. Skipped entirely under -pairwise. remeshFolder only ever
+	// PUTs a node whose set actually changed, so a folder nobody else holds
+	// (the common case for a brand-new share) costs nothing beyond the GETs
+	// that discover that.
+	if !pairwise {
+		if note := meshNote(remeshFolder(ctx, cfg, id)); note != "" {
+			if res.Note != "" {
+				res.Note += "; " + note
+			} else {
+				res.Note = note
+			}
+		}
 	}
 	return res, nil
 }
