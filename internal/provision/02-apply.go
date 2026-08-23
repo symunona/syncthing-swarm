@@ -1,12 +1,13 @@
 package provision
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"sync"
 )
 
 // Apply runs one step on the box, as root, streaming its output.
@@ -30,8 +31,12 @@ func Apply(ctx context.Context, s *SSH, step Step, out io.Writer) error {
 	if isTerminal(os.Stdin) {
 		cmd.Stdin = os.Stdin
 	}
-	cmd.Stdout = prefixWriter(out, "    │ ")
-	cmd.Stderr = prefixWriter(out, "    │ ")
+	// One writer for both streams: with `ssh -t` the remote's stderr comes back
+	// down the same pty as its stdout, and two writers would each track their own
+	// mid-line state and interleave prefixes mid-word.
+	pw := prefixWriter(out, "    │ ")
+	cmd.Stdout = pw
+	cmd.Stderr = pw
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("step %q failed: %w", step.ID, err)
 	}
@@ -54,14 +59,46 @@ func buildScript(step Step) string {
 }
 
 // prefixWriter indents remote output so it is visibly the box talking, not us.
+//
+// It writes THROUGH, byte for byte, and never waits for a line to end. The
+// line-buffered version this replaces swallowed the one piece of output that
+// matters most: sudo's "[sudo: authenticate] Password:" carries no trailing
+// newline, so it sat in the scanner's buffer until the command finished. The
+// step looked hung, the password the user typed went to a prompt nobody could
+// see, and the wizard appeared not to forward sudo at all.
+type prefixW struct {
+	mu     sync.Mutex
+	w      io.Writer
+	prefix string
+	mid    bool // a prefix has already been emitted for the line in progress
+}
+
 func prefixWriter(w io.Writer, prefix string) io.Writer {
-	pr, pw := io.Pipe()
-	go func() {
-		sc := bufio.NewScanner(pr)
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for sc.Scan() {
-			fmt.Fprintf(w, "%s%s\n", prefix, sc.Text())
+	return &prefixW{w: w, prefix: prefix}
+}
+
+func (p *prefixW) Write(b []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n := 0
+	for len(b) > 0 {
+		if !p.mid {
+			if _, err := io.WriteString(p.w, p.prefix); err != nil {
+				return n, err
+			}
+			p.mid = true
 		}
-	}()
-	return pw
+		chunk := b
+		if i := bytes.IndexByte(b, '\n'); i >= 0 {
+			chunk, p.mid = b[:i+1], false
+		}
+		m, err := p.w.Write(chunk)
+		n += m
+		if err != nil {
+			return n, err
+		}
+		b = b[m:]
+	}
+	return n, nil
 }

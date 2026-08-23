@@ -150,3 +150,57 @@ func TestConfirmDiffRespectsTheAnswer(t *testing.T) {
 		})
 	}
 }
+
+// A box with no data drive is only a problem when the boot media is the kind
+// that dies: an SD card. chloe is a laptop — one internal SATA SSD carrying
+// EFI + root + swap — and refusing to install there was the Pi rule applied
+// where its reasoning does not hold. Fall back to the home directory.
+func TestLayoutFallsBackToHomeOnADrivelessBox(t *testing.T) {
+	p := &provision.Probe{
+		Box:       provision.Box{User: "symunona"},
+		Tailscale: provision.Tailscale{IP4: "100.77.238.79"},
+		Disks: []provision.BlockDevice{{
+			Name: "sda", Type: "disk", Tran: "sata", Rota: false,
+			Children: []provision.BlockDevice{
+				{Name: "sda1", Path: "/dev/sda1", Mountpoint: "/boot/efi", FSType: "vfat"},
+				{Name: "sda2", Path: "/dev/sda2", Mountpoint: "/", FSType: "ext4"},
+				{Name: "sda3", Path: "/dev/sda3", Mountpoint: "[SWAP]", FSType: "swap"},
+			},
+		}},
+	}
+	l, err := layoutFor(p)
+	if err != nil {
+		t.Fatalf("layoutFor: %v", err)
+	}
+	if l.Mount != "" {
+		t.Errorf("Mount = %q, want empty: there is no drive to gate the unit on", l.Mount)
+	}
+	for name, got := range map[string]string{
+		"ConfigDir": l.ConfigDir,
+		"DataDir":   l.DataDir,
+		"FolderDir": l.FolderDir,
+	} {
+		if !strings.HasPrefix(got, "/home/symunona/") {
+			t.Errorf("%s = %q, want it under the user's home", name, got)
+		}
+	}
+}
+
+// The Pi rule still stands where its reasoning does: root on an SD card, no
+// data drive, means syncthing would hash onto the media that wears out.
+func TestLayoutStillRefusesWhenRootIsOnRemovableMedia(t *testing.T) {
+	p := &provision.Probe{
+		Box:       provision.Box{User: "pi"},
+		Tailscale: provision.Tailscale{IP4: "100.0.0.1"},
+		Disks: []provision.BlockDevice{{
+			Name: "mmcblk0", Type: "disk", Tran: "mmc", Rota: false, Hotplug: true,
+			Children: []provision.BlockDevice{
+				{Name: "mmcblk0p1", Path: "/dev/mmcblk0p1", Mountpoint: "/boot/firmware", FSType: "vfat"},
+				{Name: "mmcblk0p2", Path: "/dev/mmcblk0p2", Mountpoint: "/", FSType: "ext4"},
+			},
+		}},
+	}
+	if _, err := layoutFor(p); err == nil {
+		t.Fatal("layoutFor accepted an SD-card-only Pi; the folders would land on the boot media")
+	}
+}

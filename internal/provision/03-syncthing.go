@@ -171,15 +171,27 @@ func PlanSyncthing(p *Probe, l SyncthingLayout) ([]Step, error) {
 			"--config=%s --data=%s", l.ConfigDir, l.DataDir),
 	}, "\\n")
 
+	title := fmt.Sprintf("run syncthing as %s (db on %s, config on the boot media)", l.User, l.DataDir)
+	why := "the index database is the write-heavy part, and SD-card wear is what kills\n" +
+		"    these boxes — so it lives on the drive. The config and certs are tiny and\n" +
+		"    stay on the boot media, so the node's IDENTITY survives the drive dying.\n" +
+		"    The unit is gated on the mount: with the db on the drive, an unmounted\n" +
+		"    drive would otherwise have syncthing build an empty database on the SD card\n" +
+		"    and re-hash everything later. Gated, it simply does not start"
+	// No drive: the split above has nothing to split across, and describing a
+	// mount gate that the unit does not carry would be a lie in the plan the user
+	// is asked to approve.
+	if l.Mount == "" {
+		title = fmt.Sprintf("run syncthing as %s (db and folders under %s)", l.User, "/home/"+l.User)
+		why = "this box has no separate data drive, so everything lives on the one disk it\n" +
+			"    has. Nothing to gate the unit on and nothing to wear out: the SD-card split\n" +
+			"    the Pis need does not apply here"
+	}
+
 	steps = append(steps, Step{
 		ID:    "syncthing-service",
-		Title: fmt.Sprintf("run syncthing as %s (db on %s, config on the boot media)", l.User, l.DataDir),
-		Why: "the index database is the write-heavy part, and SD-card wear is what kills\n" +
-			"    these boxes — so it lives on the drive. The config and certs are tiny and\n" +
-			"    stay on the boot media, so the node's IDENTITY survives the drive dying.\n" +
-			"    The unit is gated on the mount: with the db on the drive, an unmounted\n" +
-			"    drive would otherwise have syncthing build an empty database on the SD card\n" +
-			"    and re-hash everything later. Gated, it simply does not start",
+		Title: title,
+		Why:   why,
 		Cmds: append(mk,
 			fmt.Sprintf("mkdir -p /etc/systemd/system/%s.service.d", unit),
 			fmt.Sprintf("printf '%s\\n' > /etc/systemd/system/%s.service.d/override.conf", override, unit),

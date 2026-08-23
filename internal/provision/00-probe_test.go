@@ -168,3 +168,47 @@ func TestProbeSDCardIsNotADrive(t *testing.T) {
 		t.Error("ScanETA claimed an estimate with no hash benchmark")
 	}
 }
+
+// lsblk prints no PATH for a swap partition — it prints the literal placeholder
+// "[SWAP]" in the MOUNTPOINT column. That string is not a path, but it passed
+// every test Drives() applied: it has a filesystem, it has a non-empty
+// mountpoint, and "[SWAP]" is not an OS path. So an ordinary single-disk box —
+// EFI + root + swap, no data drive at all — had its SWAP PARTITION adopted as
+// the syncthing target, and the layout came out RELATIVE:
+//
+//	--data=[SWAP]/syncthing-db   RequiresMountsFor=[SWAP]
+//
+// which root's shell resolved against the login user's home (creating a stray
+// ~/[SWAP]) while systemd, whose cwd is /, could not resolve it at all: the unit
+// enabled fine and then crash-looped. Verified on chloe.
+func TestProbeSwapIsNotADrive(t *testing.T) {
+	p := &Probe{
+		Disks: []BlockDevice{{
+			Name: "sda", Type: "disk", Tran: "sata", Rota: false,
+			Children: []BlockDevice{
+				{Name: "sda1", Path: "/dev/sda1", Mountpoint: "/boot/efi", FSType: "vfat"},
+				{Name: "sda2", Path: "/dev/sda2", Mountpoint: "/", FSType: "ext4"},
+				{Name: "sda3", Path: "/dev/sda3", Mountpoint: "[SWAP]", FSType: "swap"},
+			},
+		}},
+	}
+	if got := p.Drives(); len(got) != 0 {
+		t.Errorf("Drives() = %+v, want none: swap is not a data drive", got)
+	}
+}
+
+// Belt and braces for the same class of bug: any mountpoint that is not an
+// absolute path is a placeholder, not a place to put a database.
+func TestProbeRelativeMountpointIsNotADrive(t *testing.T) {
+	p := &Probe{
+		Disks: []BlockDevice{{
+			Name: "sdb", Type: "disk", Tran: "usb", Rota: true,
+			Children: []BlockDevice{
+				{Name: "sdb1", Path: "/dev/sdb1", Mountpoint: "[SOMETHING]", FSType: "ext4"},
+			},
+		}},
+	}
+	if got := p.Drives(); len(got) != 0 {
+		t.Errorf("Drives() = %+v, want none: %q is not an absolute path", got, "[SOMETHING]")
+	}
+}

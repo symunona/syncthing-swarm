@@ -334,7 +334,16 @@ func (p *Probe) Drives() []Drive {
 			continue
 		}
 		for _, part := range disk.Children {
-			if part.FSType == "" || part.Mountpoint == "" || osMount(part.Mountpoint) {
+			if part.FSType == "" || part.FSType == "swap" || osMount(part.Mountpoint) {
+				continue
+			}
+			// lsblk prints PLACEHOLDERS, not paths, for things that are activated
+			// rather than mounted: a swap partition arrives as MOUNTPOINT="[SWAP]".
+			// That string cleared every other test here — it has a filesystem, it
+			// is non-empty, it is not an OS path — so a plain EFI+root+swap box had
+			// its swap adopted as the data drive, and the whole syncthing layout
+			// came out relative ("[SWAP]/syncthing-db"). Require an absolute path.
+			if !strings.HasPrefix(part.Mountpoint, "/") {
 				continue
 			}
 			out = append(out, Drive{
@@ -351,6 +360,35 @@ func (p *Probe) Drives() []Drive {
 		}
 	}
 	return out
+}
+
+// RootOnRemovableMedia reports whether the filesystem root lives on media that
+// is expected to die: an SD card, or anything hotplugged.
+//
+// This is the ONLY reason a box with no data drive is a problem. On a Raspberry
+// Pi it is a real one — the SD card is what wears out, and hashing a syncthing
+// folder onto it is how you kill the box. On an ordinary machine with an
+// internal SSD there is no such hazard, and refusing to install there is the
+// Pi rule applied where its reasoning does not hold.
+//
+// A disk carrying no "/" is not the boot media, and a box whose root we cannot
+// find in the lsblk tree (an LVM or LUKS setup, where the mountpoint sits on a
+// mapper device rather than a partition) reports false: unknown is not the same
+// as removable, and the conservative answer here would refuse to provision
+// every encrypted laptop.
+func (p *Probe) RootOnRemovableMedia() bool {
+	for _, disk := range p.Disks {
+		if disk.Type != "disk" {
+			continue
+		}
+		for _, part := range disk.Children {
+			if part.Mountpoint != "/" {
+				continue
+			}
+			return disk.Tran == "mmc" || disk.Hotplug
+		}
+	}
+	return false
 }
 
 // UnmountedDrives are data partitions that are PLUGGED IN but not mounted.

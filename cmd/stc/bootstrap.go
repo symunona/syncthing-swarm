@@ -197,20 +197,37 @@ func printLedger(w io.Writer, st provision.Style, led provision.Ledger) {
 // boot media (identity survives the drive dying), database on the drive (the
 // write-heavy part, and SD wear is what kills these boxes).
 func layoutFor(p *provision.Probe) (provision.SyncthingLayout, error) {
+	home := "/home/" + p.Box.User
+	l := provision.SyncthingLayout{
+		User:      p.Box.User,
+		ConfigDir: home + "/.config/syncthing",
+		TailnetIP: p.Tailscale.IP4,
+	}
+
+	// No data drive is only a problem when the boot media is the kind that dies.
+	// On a Pi that is the whole story — the SD card wears out, so hashing folders
+	// onto it kills the box, and the wizard must refuse. On a machine with an
+	// internal disk there is no such hazard, and refusing was the Pi rule applied
+	// where its reasoning does not hold: chloe is a laptop with one SSD, and the
+	// only place its folders can go is that SSD.
 	drives := p.Drives()
 	if len(drives) == 0 {
-		return provision.SyncthingLayout{},
-			fmt.Errorf("no data drive mounted: syncthing folders would land on the boot media")
+		if p.RootOnRemovableMedia() {
+			return provision.SyncthingLayout{},
+				fmt.Errorf("no data drive mounted, and root is on removable media: " +
+					"syncthing folders would land on the boot media and wear it out")
+		}
+		// Mount stays empty: there is no drive, so the unit gets no mount gate.
+		l.DataDir = home + "/.local/share/syncthing-db"
+		l.FolderDir = home + "/syncthing"
+		return l, nil
 	}
+
 	d := drives[0]
-	return provision.SyncthingLayout{
-		User:      p.Box.User,
-		ConfigDir: "/home/" + p.Box.User + "/.config/syncthing",
-		DataDir:   d.Mountpoint + "/syncthing-db",
-		FolderDir: d.Mountpoint + "/syncthing",
-		Mount:     d.Mountpoint,
-		TailnetIP: p.Tailscale.IP4,
-	}, nil
+	l.DataDir = d.Mountpoint + "/syncthing-db"
+	l.FolderDir = d.Mountpoint + "/syncthing"
+	l.Mount = d.Mountpoint
+	return l, nil
 }
 
 func printSyncthingPlan(p *provision.Probe, nodeName string) {
