@@ -20,7 +20,7 @@ import (
 // last to leave cancels them. This keeps idle load off the fleet (the phone and
 // the rpi in particular) — nothing polls when no dashboard is open.
 type eventHub struct {
-	cfg *config.Config
+	cfg func() *config.Config // the LIVE cred store, re-read on every start
 
 	mu      sync.Mutex
 	subs    map[chan sseEvent]struct{}
@@ -41,7 +41,7 @@ type sseEvent struct {
 	Time   string `json:"time,omitempty"`
 }
 
-func newEventHub(cfg *config.Config) *eventHub {
+func newEventHub(cfg func() *config.Config) *eventHub {
 	return &eventHub{cfg: cfg, subs: map[chan sseEvent]struct{}{}}
 }
 
@@ -97,17 +97,46 @@ func (h *eventHub) subscribe() chan sseEvent {
 	defer h.mu.Unlock()
 	h.subs[ch] = struct{}{}
 	if h.cancel == nil { // first subscriber: spin up the fleet pollers
-		ctx, cancel := context.WithCancel(context.Background())
-		h.cancel = cancel
-		for _, n := range h.cfg.Nodes {
-			h.pollers.Add(1)
-			go func(n config.Node) {
-				defer h.pollers.Done()
-				h.pollNode(ctx, n)
-			}(n)
-		}
+		h.startLocked()
 	}
 	return ch
+}
+
+// startLocked spins one poller per node in the CURRENT config. Caller holds mu.
+func (h *eventHub) startLocked() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h.cancel = cancel
+	for _, n := range h.cfg().Nodes {
+		h.pollers.Add(1)
+		go func(n config.Node) {
+			defer h.pollers.Done()
+			h.pollNode(ctx, n)
+		}(n)
+	}
+}
+
+// reload restarts the node pollers against the reloaded config. A no-op while
+// no browser is watching — subscribe() will start them from the new config
+// anyway.
+//
+// The stop happens OUTSIDE the lock, like unsubscribe does: a poller calls
+// broadcast, which takes mu, so waiting for the pollers while holding it
+// deadlocks.
+func (h *eventHub) reload() {
+	h.mu.Lock()
+	cancel := h.cancel
+	h.cancel = nil
+	h.mu.Unlock()
+	if cancel == nil {
+		return // idle: nothing to restart
+	}
+	cancel()
+	h.pollers.Wait()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.subs) > 0 {
+		h.startLocked()
+	}
 }
 
 // unsubscribe removes a browser and, if it was the last, stops the pollers.

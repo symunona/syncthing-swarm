@@ -275,8 +275,70 @@ func PlanSyncthing(p *Probe, l SyncthingLayout) ([]Step, error) {
 		},
 	})
 
+	// A SECOND door to the same GUI, on loopback.
+	//
+	// syncthing takes exactly one GUI bind address, and the step above spends it
+	// on the tailnet — correctly: that is what the dashboard dials. But it also
+	// means that sitting AT the box (or on an `ssh -L` tunnel) there is nothing
+	// on 127.0.0.1:8384 any more, which is where every habit and every bookmark
+	// points. A tailnet that is down, or a `tailscale down` while debugging, then
+	// locks you out of the local web UI of a machine you are logged into.
+	//
+	// So: keep syncthing itself bound to the tailnet and put a socket-activated
+	// loopback proxy in front. systemd-socket-proxyd ships with systemd, so this
+	// installs nothing. The security property that mattered is untouched — the
+	// listener is 127.0.0.1, never 0.0.0.0 — and the exposure it adds (a local
+	// user reaching the admin GUI) is exactly what upstream syncthing does by
+	// default on a fresh install anyway.
+	steps = append(steps, Step{
+		ID:    "syncthing-gui-localhost",
+		Title: fmt.Sprintf("also serve the GUI on 127.0.0.1:8384 (proxy -> %s:8384)", l.TailnetIP),
+		Why: "the GUI binds the tailnet address and nothing else, so on the box itself\n" +
+			"    http://127.0.0.1:8384 is dead — including over an ssh tunnel, and including\n" +
+			"    when tailscale is down. A loopback socket proxy gives the local address back\n" +
+			"    without letting syncthing bind anything wider than the tailnet",
+		Cmds: []string{
+			fmt.Sprintf("printf '[Unit]\\nDescription=syncthing GUI on loopback (proxy to the tailnet bind)\\n\\n"+
+				"[Socket]\\nListenStream=127.0.0.1:8384\\n\\n"+
+				"[Install]\\nWantedBy=sockets.target\\n' > /etc/systemd/system/%s.socket", guiProxyUnit),
+			// The proxy binary's path differs across distros (merged-usr or not),
+			// so resolve it here rather than guessing, and fail loudly if the box
+			// has no systemd-socket-proxyd at all.
+			// Wrapped in a subshell: Cmds are joined with && into one script, and
+			// the bare `;` between these three statements would otherwise split the
+			// chain into separate top-level commands.
+			fmt.Sprintf("(P=$(for c in /usr/lib/systemd/systemd-socket-proxyd /lib/systemd/systemd-socket-proxyd; do "+
+				"[ -x \"$c\" ] && { echo \"$c\"; break; }; done); "+
+				"[ -n \"$P\" ] || { echo 'no systemd-socket-proxyd on this box' >&2; exit 1; }; "+
+				"printf '[Unit]\\nDescription=syncthing GUI loopback proxy\\nRequires=%s.socket\\nAfter=%s.socket\\n\\n"+
+				"[Service]\\nExecStart=%%s %s:8384\\nDynamicUser=yes\\nNoNewPrivileges=yes\\n"+
+				"ProtectSystem=strict\\nProtectHome=yes\\nPrivateTmp=yes\\n' \"$P\" > /etc/systemd/system/%s.service)",
+				guiProxyUnit, guiProxyUnit, l.TailnetIP, guiProxyUnit),
+			"systemctl daemon-reload",
+			fmt.Sprintf("systemctl enable --now %s.socket", guiProxyUnit),
+			// Same lesson as the step above: wait for the socket instead of racing
+			// the post-Check against systemd opening it.
+			"for i in $(seq 1 15); do ss -tlnH 'sport = :8384' | grep -q '127.0.0.1:8384' && break; sleep 1; done",
+			"ss -tlnH 'sport = :8384' | grep -q '127.0.0.1:8384'",
+		},
+		Needs: []string{"syncthing-gui"},
+		Check: []string{
+			// The proxy must point at THIS node's tailnet address: a box whose
+			// tailnet IP changed leaves a unit forwarding into nowhere, and the
+			// listening socket alone would still look healthy.
+			fmt.Sprintf("grep -q -- '%s:8384' /etc/systemd/system/%s.service", l.TailnetIP, guiProxyUnit),
+			fmt.Sprintf("systemctl is-active --quiet %s.socket", guiProxyUnit),
+			"ss -tlnH 'sport = :8384' | grep -q '127.0.0.1:8384'",
+		},
+	})
+
 	return steps, nil
 }
+
+// guiProxyUnit is the systemd unit pair (.socket + .service) that re-exposes the
+// GUI on loopback. Named for what it is, not for syncthing's own unit, so a
+// `systemctl status syncthing*` never confuses the two.
+const guiProxyUnit = "syncthing-gui-local"
 
 func mountGate(mount string) string {
 	if mount == "" {

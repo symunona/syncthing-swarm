@@ -33,7 +33,7 @@ var allowedREST = map[string]bool{
 // handleNodeProxy forwards GET /api/node/{name}/rest/... to that node's
 // syncthing REST API, injecting its X-API-Key. Only whitelisted paths pass.
 func (s *Server) handleNodeProxy(w http.ResponseWriter, r *http.Request) {
-	node, ok := s.nodes[r.PathValue("name")]
+	node, ok := s.node(r.PathValue("name"))
 	if !ok {
 		http.Error(w, "unknown node", http.StatusNotFound)
 		return

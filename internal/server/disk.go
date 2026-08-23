@@ -31,10 +31,10 @@ func (s *Server) collectDisk(ctx context.Context) {
 	dctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
-	out := make(map[string]diskusage.Usage, len(s.cfg.Nodes))
+	out := make(map[string]diskusage.Usage, len(s.config().Nodes))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for _, n := range s.cfg.Nodes {
+	for _, n := range s.config().Nodes {
 		wg.Add(1)
 		go func(n config.Node) {
 			defer wg.Done()

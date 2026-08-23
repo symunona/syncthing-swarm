@@ -56,9 +56,9 @@ func (s *Server) handleMesh(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 
-	polls := make([]meshPoll, len(s.cfg.Nodes))
+	polls := make([]meshPoll, len(s.config().Nodes))
 	var wg sync.WaitGroup
-	for i, n := range s.cfg.Nodes {
+	for i, n := range s.config().Nodes {
 		wg.Add(1)
 		go func(i int, n config.Node) {
 			defer wg.Done()

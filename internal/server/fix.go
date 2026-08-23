@@ -32,7 +32,7 @@ func (s *Server) fixTarget(r *http.Request) (*config.Node, fixReq, error) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return nil, req, fmt.Errorf("bad request: %w", err)
 	}
-	n, ok := s.nodes[req.Node]
+	n, ok := s.node(req.Node)
 	if !ok {
 		return nil, req, fmt.Errorf("unknown node %q", req.Node)
 	}

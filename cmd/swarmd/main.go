@@ -29,6 +29,7 @@ func main() {
 	defer stop()
 
 	srv := server.New(cfg, webui.FS)
+	srv.WatchConfig(*cfgPath) // node added to swarm.yaml -> live, no restart
 	if err := srv.Run(ctx); err != nil {
 		log.Printf("server: %v", err)
 		os.Exit(1)

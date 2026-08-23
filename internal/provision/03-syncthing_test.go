@@ -103,6 +103,9 @@ func TestSyncthingStepsChainTheirNeeds(t *testing.T) {
 		"syncthing-install": nil,
 		"syncthing-service": {"syncthing-install"},
 		"syncthing-gui":     {"syncthing-service"},
+		// The loopback proxy forwards INTO the tailnet bind, so it is meaningless
+		// until that step has actually moved the GUI there.
+		"syncthing-gui-localhost": {"syncthing-gui"},
 	}
 	for _, s := range steps {
 		got := strings.Join(s.Needs, ",")
@@ -204,5 +207,45 @@ func TestSyncthingInstallCheckTreatsTheReleaseAsAFloor(t *testing.T) {
 	}
 	if strings.Contains(joined, "grep -qE 'v"+SyncthingRelease) {
 		t.Errorf("install check still demands an exact version match: %v", s.Check)
+	}
+}
+
+// The loopback proxy exists so http://127.0.0.1:8384 works ON the box while
+// syncthing itself stays bound to the tailnet. Both halves matter: a listener on
+// 127.0.0.1 and a forward to the tailnet address — never a wider bind.
+func TestSyncthingGUIAlsoReachableOnLocalhost(t *testing.T) {
+	l := syncLayout()
+	steps, _ := PlanSyncthing(syncProbe(), l)
+	s := stepByID(steps, "syncthing-gui-localhost")
+	if s == nil {
+		t.Fatal("no syncthing-gui-localhost step")
+	}
+	cmds := strings.Join(s.Cmds, " ")
+	if !strings.Contains(cmds, "ListenStream=127.0.0.1:8384") {
+		t.Errorf("proxy does not listen on loopback: %v", s.Cmds)
+	}
+	if !strings.Contains(cmds, l.TailnetIP+":8384") {
+		t.Errorf("proxy does not forward to the tailnet GUI: %v", s.Cmds)
+	}
+	if strings.Contains(cmds, "0.0.0.0:8384") || strings.Contains(cmds, "ListenStream=8384") {
+		t.Errorf("proxy binds wider than loopback: %v", s.Cmds)
+	}
+	if len(s.Needs) == 0 || s.Needs[0] != "syncthing-gui" {
+		t.Errorf("proxy must run after the tailnet bind, needs=%v", s.Needs)
+	}
+}
+
+// The syncthing GUI step must keep binding the tailnet address: the loopback
+// proxy is an addition, not a replacement, and a node whose syncthing itself
+// listens on 127.0.0.1 is unreachable from the dashboard.
+func TestLoopbackProxyDidNotReplaceTheTailnetBind(t *testing.T) {
+	l := syncLayout()
+	steps, _ := PlanSyncthing(syncProbe(), l)
+	gui := stepByID(steps, "syncthing-gui")
+	if gui == nil {
+		t.Fatal("no syncthing-gui step")
+	}
+	if !strings.Contains(strings.Join(gui.Cmds, " "), "<address>"+l.TailnetIP+":8384</address>") {
+		t.Errorf("gui step no longer writes the tailnet bind: %v", gui.Cmds)
 	}
 }

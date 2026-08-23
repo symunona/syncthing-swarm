@@ -16,6 +16,10 @@ API. Nodes reachable over Tailscale.
 - **Transport** Tailscale. Hub hit each node `http://<tailnet-ip>:8384` with
   its `X-API-Key`. No port-forward.
 - **Cred store** `swarm.yaml`. Plaintext. Gitignored. You edit, add node.
+  Hot-reloaded: `swarmd` re-reads it ~2s after it changes, so a node added by
+  hand or by `stc bootstrap` shows up with no restart. A yaml that fails to
+  parse is logged and ignored — the last good config keeps serving. Changing
+  `listen` still needs a restart (the socket is already bound).
 - **State** in-memory snapshot. Poll loop every N sec. No DB (MVP).
 
 ## Layout
@@ -55,6 +59,22 @@ go build -tags embedweb -o swarmd ./cmd/swarmd
 ```
 
 `make build` do the two-step. `make test` run go tests.
+
+## Node GUI addresses
+
+Provisioned nodes bind syncthing GUI to the **tailnet IP only** — never
+`0.0.0.0`. On top of that the wizard adds a systemd socket proxy so
+`http://127.0.0.1:8384` works ON the box too (local browser, `ssh -L` tunnel,
+tailnet down). Units: `syncthing-gui-local.{socket,service}`, forwarding
+loopback -> `<tailnet-ip>:8384`, using `systemd-socket-proxyd` (ships with
+systemd, installs nothing).
+
+Existing nodes get it by re-running the wizard — idempotent, every finished
+step reports `already`:
+
+```bash
+stc bootstrap fiona -syncthing
+```
 
 ## Get a node apikey
 

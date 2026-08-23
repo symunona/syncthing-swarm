@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/symunona/syncthing-dashboard/internal/aggregate"
@@ -19,10 +20,20 @@ import (
 var nowFunc = time.Now
 
 type Server struct {
-	cfg   *config.Config
+	// cfgPtr holds the live cred store. It is swapped wholesale on reload
+	// (see reload.go) rather than mutated, so every reader either sees the
+	// old config or the new one and never a half-updated one.
+	cfgPtr  atomic.Pointer[config.Config]
+	cfgPath  string // watched for changes; empty = no hot reload
+	cfgStamp string // contents hash of the cred store as last loaded
+
 	web   fs.FS
-	nodes map[string]config.Node // name -> node, for the relay proxy
 	proxy *http.Client
+
+	nodesMu sync.RWMutex
+	nodes   map[string]config.Node // name -> node, for the relay proxy
+
+	pollNow chan struct{} // reload pokes this to repoll without waiting a tick
 
 	mu   sync.RWMutex
 	snap *aggregate.Snapshot
@@ -34,18 +45,49 @@ type Server struct {
 }
 
 func New(cfg *config.Config, web fs.FS) *Server {
+	s := &Server{
+		web:     web,
+		proxy:   &http.Client{Timeout: 12 * time.Second},
+		pollNow: make(chan struct{}, 1),
+	}
+	s.cfgPtr.Store(cfg)
+	s.setNodes(cfg)
+	s.events = newEventHub(s.config)
+	return s
+}
+
+// config is the cred store as of right now. Callers must not hold it across a
+// long operation and expect it to stay current — they should just re-read.
+func (s *Server) config() *config.Config { return s.cfgPtr.Load() }
+
+// setNodes rebuilds the name -> node index the relay proxy and the fix
+// endpoints look up by name.
+func (s *Server) setNodes(cfg *config.Config) {
 	nodes := make(map[string]config.Node, len(cfg.Nodes))
 	for _, n := range cfg.Nodes {
 		nodes[n.Name] = n
 	}
-	s := &Server{
-		cfg:   cfg,
-		web:   web,
-		nodes: nodes,
-		proxy: &http.Client{Timeout: 12 * time.Second},
-	}
-	s.events = newEventHub(cfg)
-	return s
+	s.nodesMu.Lock()
+	s.nodes = nodes
+	s.nodesMu.Unlock()
+}
+
+// node looks one node up by name in the live config.
+func (s *Server) node(name string) (config.Node, bool) {
+	s.nodesMu.RLock()
+	defer s.nodesMu.RUnlock()
+	n, ok := s.nodes[name]
+	return n, ok
+}
+
+// WatchConfig makes the server reload path whenever it changes on disk, so a
+// node added by `stc bootstrap` shows up without a restart.
+func (s *Server) WatchConfig(path string) {
+	s.cfgPath = path
+	// Baseline taken HERE, not in the watcher goroutine: a swarm.yaml written
+	// between New and the goroutine's first tick would otherwise become the
+	// baseline itself and never register as a change.
+	s.cfgStamp, _ = stampFile(path)
 }
 
 // Run polls forever and serves HTTP until ctx is cancelled.
@@ -53,6 +95,9 @@ func (s *Server) Run(ctx context.Context) error {
 	s.pollOnce(ctx) // prime immediately
 	go s.pollLoop(ctx)
 	go s.diskLoop(ctx) // disk stats on a slower cadence
+	if s.cfgPath != "" {
+		go s.watchConfig(ctx) // pick up nodes added while we run
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/matrix", s.handleMatrix)
@@ -76,14 +121,15 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.Handle("/", http.FileServer(http.FS(s.web)))
 	}
 
-	srv := &http.Server{Addr: s.cfg.Listen, Handler: mux}
+	srv := &http.Server{Addr: s.config().Listen, Handler: mux}
 	go func() {
 		<-ctx.Done()
 		sd, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		srv.Shutdown(sd)
 	}()
-	log.Printf("dashboard on http://%s  (%d nodes, poll %ds)", s.cfg.Listen, len(s.cfg.Nodes), s.cfg.PollSeconds)
+	cfg := s.config()
+	log.Printf("dashboard on http://%s  (%d nodes, poll %ds)", cfg.Listen, len(cfg.Nodes), cfg.PollSeconds)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
@@ -91,22 +137,25 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) pollLoop(ctx context.Context) {
-	t := time.NewTicker(time.Duration(s.cfg.PollSeconds) * time.Second)
-	defer t.Stop()
 	for {
+		// Interval re-read every round: a reloaded pollSeconds applies at once.
+		wait := time.NewTimer(time.Duration(s.config().PollSeconds) * time.Second)
 		select {
 		case <-ctx.Done():
+			wait.Stop()
 			return
-		case <-t.C:
-			s.pollOnce(ctx)
+		case <-wait.C:
+		case <-s.pollNow: // config reloaded: show the new node now, not in 15s
+			wait.Stop()
 		}
+		s.pollOnce(ctx)
 	}
 }
 
 func (s *Server) pollOnce(ctx context.Context) {
 	pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	snap := aggregate.Poll(pctx, s.cfg, nowFunc())
+	snap := aggregate.Poll(pctx, s.config(), nowFunc())
 	s.mu.Lock()
 	s.snap = snap
 	s.mu.Unlock()
